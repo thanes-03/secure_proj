@@ -1,0 +1,22 @@
+{% extends 'base.html' %}
+{% block title %}Audit Logs{% endblock %}
+{% block content %}
+<h2 class="mt-4">Audit Logs</h2>
+<table class="table table-sm mt-3">
+  <thead><tr><th>Time</th><th>User ID</th><th>Action</th><th>IP</th></tr></thead>
+  <tbody>
+  {% for log in logs.items %}
+  <tr>
+    <td>{{ log.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+    <td>{{ log.user_id }}</td>
+    <td>{{ log.action | e }}</td>
+    <td>{{ log.ip_address | e }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<nav>
+  {% if logs.has_prev %}<a href="{{ url_for('admin.audit_logs', page=logs.prev_num) }}" class="btn btn-sm btn-outline-secondary">Prev</a>{% endif %}
+  {% if logs.has_next %}<a href="{{ url_for('admin.audit_logs', page=logs.next_num) }}" class="btn btn-sm btn-outline-secondary ms-1">Next</a>{% endif %}
+</nav>
+{% endblock %}

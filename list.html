@@ -1,0 +1,32 @@
+{% extends 'base.html' %}
+{% block title %}Admin — Users{% endblock %}
+{% block content %}
+<h2 class="mt-4">All Users</h2>
+<table class="table table-striped mt-3">
+  <thead><tr><th>Email</th><th>Role</th><th>Verified</th><th>Active</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for u in users %}
+  <tr>
+    <td>{{ u.email | e }}</td>
+    <td>{{ u.role }}</td>
+    <td>{{ '✓' if u.is_verified else '✗' }}</td>
+    <td>{{ '✓' if u.is_active else '✗' }}</td>
+    <td>
+      {% if u.is_active and u.role != 'admin' %}
+      <form method="POST" action="{{ url_for('admin.suspend_user', user_id=u.id) }}" class="d-inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-sm btn-warning">Suspend</button>
+      </form>
+      {% elif not u.is_active %}
+      <form method="POST" action="{{ url_for('admin.activate_user', user_id=u.id) }}" class="d-inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-sm btn-success">Activate</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<a href="{{ url_for('admin.audit_logs') }}" class="btn btn-outline-secondary">View Audit Logs</a>
+{% endblock %}

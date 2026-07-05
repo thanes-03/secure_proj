@@ -1,0 +1,33 @@
+from functools import wraps
+from flask import session, redirect, url_for, abort
+from .models import User
+
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user_id = session.get('user_id')
+        if not user_id:
+            return redirect(url_for('auth.login'))
+        user = User.query.get(user_id)
+        if not user or not user.is_active or not user.is_verified:
+            session.clear()
+            return redirect(url_for('auth.login'))
+        return f(*args, **kwargs)
+    return decorated
+
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user_id = session.get('user_id')
+        if not user_id:
+            return redirect(url_for('auth.login'))
+        user = User.query.get(user_id)
+        if not user or not user.is_active or not user.is_verified:
+            session.clear()
+            return redirect(url_for('auth.login'))
+        if user.role != 'admin':
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated

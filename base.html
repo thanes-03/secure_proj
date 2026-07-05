@@ -1,0 +1,15 @@
+from flask_wtf import FlaskForm
+from wtforms import StringField, TextAreaField, SubmitField
+from wtforms.validators import DataRequired, Length, Email
+
+
+class NoteForm(FlaskForm):
+    title = StringField('Title', validators=[DataRequired(), Length(max=200)])
+    body = TextAreaField('Content', validators=[DataRequired()])
+    submit = SubmitField('Save Note')
+
+
+class ShareForm(FlaskForm):
+    recipient_email = StringField('Recipient UTM Email', validators=[DataRequired(), Email(), Length(max=255)])
+    permission = StringField('Permission')  # populated from select in template
+    submit = SubmitField('Share')

@@ -1,0 +1,339 @@
+import json
+import base64
+from datetime import datetime
+
+import bleach
+from flask import render_template, redirect, url_for, session, request, flash, abort, Response, current_app
+
+from . import bp
+from .forms import NoteForm, ShareForm
+from ..decorators import login_required
+from ..extensions import db
+from ..models import User, Note, NoteKey, NoteAccess, AuditLog, Transaction
+from ..crypto import (
+    generate_nonce, aes_encrypt, aes_decrypt, aes_decrypt_sealed,
+    generate_note_key,
+    wrap_key_with_vault, unwrap_key_with_vault,
+    rsa_encrypt_key, rsa_decrypt_key,
+    rsa_sign, rsa_verify,
+)
+
+
+def _current_user():
+    return User.query.get(session['user_id'])
+
+
+def _vault_key() -> bytes:
+    return bytes.fromhex(session['vault_key'])
+
+
+def _resolve_note_key(note_id: int, user_id: int, vault_key: bytes) -> bytes:
+    nk = NoteKey.query.filter_by(note_id=note_id, user_id=user_id).first()
+    if not nk:
+        abort(403)
+    if nk.key_type == 'vault':
+        return unwrap_key_with_vault(vault_key, nk.key_nonce, nk.encrypted_note_key)
+    user = User.query.get(user_id)
+    private_pem = aes_decrypt_sealed(vault_key, user.rsa_private_key_encrypted)
+    return rsa_decrypt_key(private_pem, nk.encrypted_note_key)
+
+
+def _resolve_kt(tx, user, vault_key: bytes) -> bytes:
+    """Recover a transaction's per-receipt key K_t for the requesting party."""
+    if user.id == tx.sender_id:
+        return unwrap_key_with_vault(vault_key, tx.kt_sender_nonce, tx.kt_sender_wrapped)
+    private_pem = aes_decrypt_sealed(vault_key, user.rsa_private_key_encrypted)
+    return rsa_decrypt_key(private_pem, tx.kt_receiver_wrapped)
+
+
+def _receipt_message(file_name, sender_email, receiver_email, created_at):
+    """Canonical, deterministic byte string that gets signed/verified."""
+    return json.dumps({
+        'file_name': file_name,
+        'sender': sender_email,
+        'receiver': receiver_email,
+        'time': created_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
+    }, sort_keys=True, separators=(',', ':')).encode()
+
+
+def _audit(user_id, action):
+    db.session.add(AuditLog(
+        user_id=user_id,
+        action=action,
+        ip_address=request.remote_addr,
+        user_agent=request.user_agent.string,
+    ))
+    db.session.commit()
+
+
+def _can_access(note: Note, user_id: int) -> bool:
+    if note.owner_id == user_id:
+        return True
+    return NoteAccess.query.filter_by(note_id=note.id, user_id=user_id).first() is not None
+
+
+def _can_edit(note: Note, user_id: int) -> bool:
+    if note.owner_id == user_id:
+        return True
+    access = NoteAccess.query.filter_by(note_id=note.id, user_id=user_id).first()
+    return access is not None and access.permission == 'write'
+
+
+@bp.route('/')
+@login_required
+def list_notes():
+    user = _current_user()
+    vault_key = _vault_key()
+
+    def _title(note):
+        try:
+            nk = _resolve_note_key(note.id, user.id, vault_key)
+            return aes_decrypt(nk, note.nonce, note.title_ciphertext).decode()
+        except Exception:
+            return '[Decryption error]'
+
+    owned = Note.query.filter_by(owner_id=user.id).all()
+    shared_ids = [a.note_id for a in NoteAccess.query.filter_by(user_id=user.id).all()]
+    shared = Note.query.filter(Note.id.in_(shared_ids)).all() if shared_ids else []
+
+    return render_template('notes/list.html',
+        owned=[(n, _title(n)) for n in owned],
+        shared=[(n, _title(n)) for n in shared],
+    )
+
+
+@bp.route('/new', methods=['GET', 'POST'])
+@login_required
+def create_note():
+    form = NoteForm()
+    if form.validate_on_submit():
+        user = _current_user()
+        vault_key = _vault_key()
+        title = bleach.clean(form.title.data.strip())
+        body = bleach.clean(form.body.data.strip())
+
+        note_key = generate_note_key()
+        nonce = generate_nonce()
+        body_nonce = generate_nonce()
+        note = Note(
+            owner_id=user.id,
+            title_ciphertext=aes_encrypt(note_key, nonce, title.encode()),
+            body_ciphertext=aes_encrypt(note_key, body_nonce, body.encode()),
+            nonce=nonce,
+            body_nonce=body_nonce,
+        )
+        db.session.add(note)
+        db.session.flush()
+
+        key_nonce, encrypted_note_key = wrap_key_with_vault(vault_key, note_key)
+        db.session.add(NoteKey(
+            note_id=note.id,
+            user_id=user.id,
+            encrypted_note_key=encrypted_note_key,
+            key_nonce=key_nonce,
+            key_type='vault',
+        ))
+        db.session.commit()
+        _audit(user.id, 'note_create')
+        flash('Note saved.', 'success')
+        return redirect(url_for('notes.view_note', note_id=note.id))
+    return render_template('notes/form.html', form=form, action='Create')
+
+
+@bp.route('/<int:note_id>')
+@login_required
+def view_note(note_id):
+    note = Note.query.get_or_404(note_id)
+    user = _current_user()
+    if not _can_access(note, user.id):
+        abort(403)
+    vault_key = _vault_key()
+    note_key = _resolve_note_key(note.id, user.id, vault_key)
+    title = aes_decrypt(note_key, note.nonce, note.title_ciphertext).decode()
+    body = aes_decrypt(note_key, note.body_nonce, note.body_ciphertext).decode()
+    is_owner = note.owner_id == user.id
+    return render_template('notes/view.html', note=note, title=title, body=body, is_owner=is_owner)
+
+
+@bp.route('/<int:note_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_note(note_id):
+    note = Note.query.get_or_404(note_id)
+    user = _current_user()
+    if not _can_edit(note, user.id):
+        abort(403)
+    vault_key = _vault_key()
+    note_key = _resolve_note_key(note.id, user.id, vault_key)
+    form = NoteForm()
+    if form.validate_on_submit():
+        title = bleach.clean(form.title.data.strip())
+        body = bleach.clean(form.body.data.strip())
+        new_note_key = generate_note_key()
+        new_nonce = generate_nonce()
+        new_body_nonce = generate_nonce()
+        note.title_ciphertext = aes_encrypt(new_note_key, new_nonce, title.encode())
+        note.body_ciphertext = aes_encrypt(new_note_key, new_body_nonce, body.encode())
+        note.nonce = new_nonce
+        note.body_nonce = new_body_nonce
+        # Re-wrap only for the current user; other vault users would need their own
+        # password to re-derive their vault_key, which we don't have server-side.
+        # RSA-shared recipients are not re-wrapped either — see note below.
+        my_nk = NoteKey.query.filter_by(note_id=note.id, user_id=user.id).first()
+        my_nk.key_nonce, my_nk.encrypted_note_key = wrap_key_with_vault(vault_key, new_note_key)
+        db.session.commit()
+        _audit(user.id, 'note_edit')
+        flash('Note updated.', 'success')
+        return redirect(url_for('notes.view_note', note_id=note.id))
+    if request.method == 'GET':
+        form.title.data = aes_decrypt(note_key, note.nonce, note.title_ciphertext).decode()
+        form.body.data = aes_decrypt(note_key, note.body_nonce, note.body_ciphertext).decode()
+    return render_template('notes/form.html', form=form, action='Edit')
+
+
+@bp.route('/<int:note_id>/delete', methods=['POST'])
+@login_required
+def delete_note(note_id):
+    note = Note.query.get_or_404(note_id)
+    user = _current_user()
+    if note.owner_id != user.id:
+        abort(403)
+    Transaction.query.filter_by(note_id=note.id).update({'note_id': None})
+    db.session.delete(note)
+    db.session.commit()
+    _audit(user.id, 'note_delete')
+    flash('Note deleted.', 'success')
+    return redirect(url_for('notes.list_notes'))
+
+
+import re as _re
+_UTM_RE = _re.compile(r'^[a-zA-Z0-9._%+\-]+@graduate\.utm\.my$')
+
+@bp.route('/<int:note_id>/share', methods=['GET', 'POST'])
+@login_required
+def share_note(note_id):
+    note = Note.query.get_or_404(note_id)
+    user = _current_user()
+    if note.owner_id != user.id:
+        abort(403)
+
+    form = ShareForm()
+    if form.validate_on_submit():
+        recipient_email = bleach.clean(form.recipient_email.data.strip().lower())
+        permission = form.permission.data if form.permission.data in ('read', 'write') else 'read'
+
+        if not _UTM_RE.match(recipient_email):
+            flash('Recipient must have a @graduate.utm.my email.', 'danger')
+            return render_template('notes/share.html', form=form, note_id=note_id)
+
+        recipient = User.query.filter_by(email=recipient_email, is_verified=True, is_active=True).first()
+        if not recipient:
+            flash('No verified UTM account found with that email.', 'danger')
+            return render_template('notes/share.html', form=form, note_id=note_id)
+
+        if recipient.id == user.id:
+            flash('You already own this note.', 'warning')
+            return render_template('notes/share.html', form=form, note_id=note_id)
+
+        existing = NoteAccess.query.filter_by(note_id=note.id, user_id=recipient.id).first()
+        if existing:
+            flash('Already shared with this user.', 'warning')
+            return render_template('notes/share.html', form=form, note_id=note_id)
+
+        vault_key = _vault_key()
+        note_key = _resolve_note_key(note.id, user.id, vault_key)
+        encrypted_for_recipient = rsa_encrypt_key(recipient.rsa_public_key.encode(), note_key)
+
+        db.session.add(NoteKey(
+            note_id=note.id,
+            user_id=recipient.id,
+            encrypted_note_key=encrypted_for_recipient,
+            key_nonce=None,  # RSA-OAEP has no separate nonce
+            key_type='rsa',
+        ))
+        db.session.add(NoteAccess(note_id=note.id, user_id=recipient.id, permission=permission))
+
+        # --- Transaction receipt (signed, self-contained snapshot) ---
+        title_plain = aes_decrypt(note_key, note.nonce, note.title_ciphertext)
+        kt = generate_note_key()
+        fn_nonce = generate_nonce()
+        filename_ciphertext = aes_encrypt(kt, fn_nonce, title_plain)
+        kt_sender_nonce, kt_sender_wrapped = wrap_key_with_vault(vault_key, kt)
+        kt_receiver_wrapped = rsa_encrypt_key(recipient.rsa_public_key.encode(), kt)
+        tx_created_at = datetime.utcnow().replace(microsecond=0)
+        private_pem = aes_decrypt_sealed(vault_key, user.rsa_private_key_encrypted)
+        signature = rsa_sign(private_pem, _receipt_message(
+            title_plain.decode(), user.email, recipient.email, tx_created_at))
+        db.session.add(Transaction(
+            note_id=note.id,
+            sender_id=user.id, receiver_id=recipient.id,
+            sender_email=user.email, receiver_email=recipient.email,
+            created_at=tx_created_at,
+            filename_ciphertext=filename_ciphertext, filename_nonce=fn_nonce,
+            kt_sender_wrapped=kt_sender_wrapped, kt_sender_nonce=kt_sender_nonce,
+            kt_receiver_wrapped=kt_receiver_wrapped, signature=signature,
+        ))
+
+        db.session.commit()
+        _audit(user.id, 'note_share')
+        _audit(user.id, 'transaction_create')
+        flash(f'Note shared with {recipient_email}.', 'success')
+        return redirect(url_for('notes.view_note', note_id=note_id))
+
+    return render_template('notes/share.html', form=form, note_id=note_id)
+
+
+@bp.route('/transactions/<int:tx_id>/download')
+@login_required
+def download_transaction(tx_id):
+    tx = Transaction.query.get_or_404(tx_id)
+    user = _current_user()
+    if user.id not in (tx.sender_id, tx.receiver_id):
+        abort(403)
+    vault_key = _vault_key()
+    try:
+        kt = _resolve_kt(tx, user, vault_key)
+        file_name = aes_decrypt(kt, tx.filename_nonce, tx.filename_ciphertext).decode()
+    except Exception:
+        flash('Receipt could not be decrypted — it may be corrupted.', 'danger')
+        return redirect(url_for('notes.list_transactions'))
+    sender = User.query.get(tx.sender_id)
+    message = _receipt_message(file_name, tx.sender_email, tx.receiver_email, tx.created_at)
+    if not rsa_verify(sender.rsa_public_key.encode(), message, tx.signature):
+        flash('Receipt failed signature verification — it may have been tampered with.', 'danger')
+        return redirect(url_for('notes.list_transactions'))
+    receipt = {
+        'file_name': file_name,
+        'sender': tx.sender_email,
+        'receiver': tx.receiver_email,
+        'time': tx.created_at.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'signature': base64.b64encode(tx.signature).decode(),
+        'signature_algorithm': 'RSASSA-PSS / SHA-256',
+        'sender_public_key': sender.rsa_public_key,
+    }
+    _audit(user.id, 'transaction_download')
+    return Response(
+        json.dumps(receipt, indent=2),
+        mimetype='application/json',
+        headers={'Content-Disposition': f'attachment; filename=transaction-{tx.id}.json'},
+    )
+
+
+@bp.route('/transactions')
+@login_required
+def list_transactions():
+    user = _current_user()
+    vault_key = _vault_key()
+    txs = Transaction.query.filter(
+        (Transaction.sender_id == user.id) | (Transaction.receiver_id == user.id)
+    ).order_by(Transaction.created_at.desc()).all()
+
+    def _fn(tx):
+        try:
+            kt = _resolve_kt(tx, user, vault_key)
+            return aes_decrypt(kt, tx.filename_nonce, tx.filename_ciphertext).decode()
+        except Exception:
+            return '[Decryption error]'
+
+    sent = [(t, _fn(t)) for t in txs if t.sender_id == user.id]
+    received = [(t, _fn(t)) for t in txs if t.receiver_id == user.id]
+    return render_template('notes/transactions.html', sent=sent, received=received)

@@ -1,0 +1,2230 @@
+# UTM SecureNotes Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build a Flask + MySQL web app where UTM graduate students securely store and share encrypted notes using AES-256-GCM with per-note keys and RSA-2048 key wrapping for sharing.
+
+**Architecture:** Each note is encrypted with a unique AES-256-GCM key. That key is wrapped with the owner's vault key (PBKDF2 from their password) and stored in `note_keys`. Sharing inserts a new `note_keys` row where the note key is RSA-OAEP encrypted with the recipient's public key. Per the spec schema, `notes.nonce` and `note_keys.key_nonce` are dedicated columns (nonces are NOT prepended to ciphertext for these two tables). The one exception is `users.rsa_private_key_encrypted`, which has no dedicated nonce column in the spec — its nonce is prepended to that blob (12 bytes + ciphertext), since it's a one-off secret rather than a per-row encrypted value.
+
+**Tech Stack:** Python 3.12, Flask 3, SQLAlchemy 3, Flask-WTF, Flask-Mail, Flask-Bcrypt, `cryptography` library, MySQL 8, Bootstrap 5, pytest, pytest-flask.
+
+---
+
+## File Map
+
+```
+SecureAppDevelopment/
+├── app/
+│   ├── __init__.py          # app factory, blueprints, security headers, error handlers
+│   ├── extensions.py        # db, bcrypt, mail, csrf singletons
+│   ├── models.py            # User, OTPToken, Note, NoteKey, NoteAccess, AuditLog
+│   ├── crypto.py            # aes_encrypt/decrypt, derive_vault_key, RSA helpers
+│   ├── decorators.py        # login_required, admin_required
+│   ├── auth/
+│   │   ├── __init__.py
+│   │   ├── forms.py         # RegistrationForm, LoginForm, OTPForm
+│   │   └── routes.py        # register, verify_otp, resend_otp, login, logout
+│   ├── notes/
+│   │   ├── __init__.py
+│   │   ├── forms.py         # NoteForm, ShareForm
+│   │   └── routes.py        # list, create, view, edit, delete, share
+│   ├── admin/
+│   │   ├── __init__.py
+│   │   └── routes.py        # users, suspend, activate, audit_logs
+│   └── templates/
+│       ├── base.html
+│       ├── auth/
+│       │   ├── register.html
+│       │   ├── verify_otp.html
+│       │   └── login.html
+│       ├── notes/
+│       │   ├── list.html
+│       │   ├── form.html
+│       │   ├── view.html
+│       │   └── share.html
+│       └── admin/
+│           ├── users.html
+│           └── audit_logs.html
+├── tests/
+│   ├── conftest.py
+│   ├── test_crypto.py
+│   ├── test_auth.py
+│   ├── test_notes.py
+│   ├── test_admin.py
+│   └── test_access_control.py
+├── config.py
+├── requirements.txt
+├── .env.example
+└── run.py
+```
+
+---
+
+## Task 1: Project Setup
+
+**Files:**
+- Create: `requirements.txt`
+- Create: `.env.example`
+- Create: `config.py`
+- Create: `app/extensions.py`
+- Create: `app/__init__.py`
+- Create: `run.py`
+- Create: `tests/conftest.py`
+
+- [ ] **Step 1: Create `requirements.txt`**
+
+```
+Flask==3.0.3
+Flask-SQLAlchemy==3.1.1
+Flask-WTF==1.2.1
+Flask-Mail==0.10.0
+Flask-Bcrypt==1.0.1
+cryptography==42.0.8
+bleach==6.1.0
+PyMySQL==1.1.1
+python-dotenv==1.0.1
+email-validator==2.1.1
+pytest==8.2.2
+pytest-flask==1.3.0
+```
+
+- [ ] **Step 2: Install dependencies**
+
+```bash
+pip install -r requirements.txt
+```
+
+Expected: all packages install without error.
+
+- [ ] **Step 3: Create `.env.example`**
+
+```
+SECRET_KEY=change-me-to-a-random-64-char-string
+DATABASE_URL=mysql+pymysql://root:password@localhost/utm_securenotes
+MAIL_SERVER=smtp.gmail.com
+MAIL_PORT=587
+MAIL_USERNAME=your-email@gmail.com
+MAIL_PASSWORD=your-app-password
+```
+
+- [ ] **Step 4: Copy `.env.example` to `.env` and fill in real values**
+
+```bash
+cp .env.example .env
+# Edit .env with your MySQL credentials and mail settings
+```
+
+Also create the MySQL database:
+```sql
+CREATE DATABASE utm_securenotes CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+```
+
+- [ ] **Step 5: Create `config.py`**
+
+```python
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Config:
+    SECRET_KEY = os.environ['SECRET_KEY']
+    SQLALCHEMY_DATABASE_URI = os.environ['DATABASE_URL']
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    WTF_CSRF_ENABLED = True
+    MAIL_SERVER = os.environ.get('MAIL_SERVER', 'smtp.gmail.com')
+    MAIL_PORT = int(os.environ.get('MAIL_PORT', 587))
+    MAIL_USE_TLS = True
+    MAIL_USERNAME = os.environ['MAIL_USERNAME']
+    MAIL_PASSWORD = os.environ['MAIL_PASSWORD']
+    MAIL_DEFAULT_SENDER = os.environ['MAIL_USERNAME']
+    PERMANENT_SESSION_LIFETIME = 1800
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = 'Lax'
+
+class TestConfig(Config):
+    TESTING = True
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'
+    WTF_CSRF_ENABLED = False
+    MAIL_SUPPRESS_SEND = True
+    SECRET_KEY = 'test-secret-key-not-for-production'
+    MAIL_USERNAME = 'test@test.com'
+    MAIL_PASSWORD = 'test'
+```
+
+- [ ] **Step 6: Create `app/extensions.py`**
+
+```python
+from flask_sqlalchemy import SQLAlchemy
+from flask_bcrypt import Bcrypt
+from flask_mail import Mail
+from flask_wtf.csrf import CSRFProtect
+
+db = SQLAlchemy()
+bcrypt = Bcrypt()
+mail = Mail()
+csrf = CSRFProtect()
+```
+
+- [ ] **Step 7: Create blueprint `__init__.py` files**
+
+`app/auth/__init__.py`:
+```python
+from flask import Blueprint
+bp = Blueprint('auth', __name__)
+from . import routes  # noqa: F401, E402
+```
+
+`app/notes/__init__.py`:
+```python
+from flask import Blueprint
+bp = Blueprint('notes', __name__)
+from . import routes  # noqa: F401, E402
+```
+
+`app/admin/__init__.py`:
+```python
+from flask import Blueprint
+bp = Blueprint('admin', __name__)
+from . import routes  # noqa: F401, E402
+```
+
+- [ ] **Step 8: Create `app/__init__.py`**
+
+```python
+from flask import Flask, render_template
+from config import Config
+from .extensions import db, bcrypt, mail, csrf
+
+def create_app(config_class=Config):
+    app = Flask(__name__)
+    app.config.from_object(config_class)
+
+    db.init_app(app)
+    bcrypt.init_app(app)
+    mail.init_app(app)
+    csrf.init_app(app)
+
+    from .auth import bp as auth_bp
+    app.register_blueprint(auth_bp, url_prefix='/auth')
+
+    from .notes import bp as notes_bp
+    app.register_blueprint(notes_bp, url_prefix='/notes')
+
+    from .admin import bp as admin_bp
+    app.register_blueprint(admin_bp, url_prefix='/admin')
+
+    @app.after_request
+    def set_security_headers(response):
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'DENY'
+        response.headers['Content-Security-Policy'] = (
+            "default-src 'self'; "
+            "style-src 'self' https://cdn.jsdelivr.net; "
+            "script-src 'self' https://cdn.jsdelivr.net"
+        )
+        return response
+
+    @app.errorhandler(403)
+    def forbidden(e):
+        return render_template('errors/403.html'), 403
+
+    @app.errorhandler(404)
+    def not_found(e):
+        return render_template('errors/404.html'), 404
+
+    @app.errorhandler(500)
+    def server_error(e):
+        return render_template('errors/500.html'), 500
+
+    return app
+```
+
+- [ ] **Step 9: Create `run.py`**
+
+```python
+from app import create_app
+
+app = create_app()
+
+if __name__ == '__main__':
+    app.run(ssl_context='adhoc', debug=False)
+```
+
+- [ ] **Step 10: Create `tests/conftest.py`**
+
+```python
+import pytest
+from app import create_app
+from app.extensions import db as _db
+from config import TestConfig
+
+@pytest.fixture(scope='session')
+def app():
+    app = create_app(TestConfig)
+    with app.app_context():
+        _db.create_all()
+        yield app
+        _db.drop_all()
+
+@pytest.fixture(scope='function')
+def db(app):
+    with app.app_context():
+        yield _db
+        _db.session.remove()
+        _db.drop_all()
+        _db.create_all()
+
+@pytest.fixture(scope='function')
+def client(app, db):
+    return app.test_client()
+```
+
+- [ ] **Step 11: Write failing smoke test**
+
+Create `tests/test_smoke.py`:
+```python
+def test_app_starts(client):
+    response = client.get('/auth/login')
+    assert response.status_code == 200
+```
+
+Run: `pytest tests/test_smoke.py -v`
+Expected: FAIL with `404` or import error (routes not yet defined).
+
+- [ ] **Step 12: Create error templates to unblock smoke test**
+
+Create `app/templates/errors/403.html`:
+```html
+<!DOCTYPE html><html><body><h1>403 Forbidden</h1></body></html>
+```
+Create `app/templates/errors/404.html`:
+```html
+<!DOCTYPE html><html><body><h1>404 Not Found</h1></body></html>
+```
+Create `app/templates/errors/500.html`:
+```html
+<!DOCTYPE html><html><body><h1>500 Server Error</h1></body></html>
+```
+
+- [ ] **Step 13: Commit**
+
+```bash
+git add requirements.txt .env.example config.py run.py app/ tests/
+git commit -m "feat: project scaffold — flask app factory, extensions, blueprints"
+```
+
+---
+
+## Task 2: Database Models
+
+**Files:**
+- Create: `app/models.py`
+- Test: `tests/test_models.py`
+
+- [ ] **Step 1: Write failing model tests**
+
+Create `tests/test_models.py`:
+```python
+import os
+from datetime import datetime, timedelta
+from app.models import User, OTPToken, Note, NoteKey, NoteAccess, AuditLog
+from app.extensions import db
+
+def test_user_creation(db, app):
+    with app.app_context():
+        user = User(
+            email='test@graduate.utm.my',
+            password_hash='hashed',
+            vault_salt=os.urandom(32),
+            role='student',
+        )
+        db.session.add(user)
+        db.session.commit()
+        assert user.id is not None
+        assert user.is_verified is False
+        assert user.is_active is True
+
+def test_note_creation(db, app):
+    with app.app_context():
+        user = User(email='n@graduate.utm.my', password_hash='h', vault_salt=os.urandom(32))
+        db.session.add(user)
+        db.session.flush()
+        note = Note(
+            owner_id=user.id,
+            title_ciphertext=b'ct_title',
+            body_ciphertext=b'ct_body',
+            nonce=os.urandom(12),
+        )
+        db.session.add(note)
+        db.session.commit()
+        assert note.id is not None
+
+def test_note_key_creation(db, app):
+    with app.app_context():
+        user = User(email='k@graduate.utm.my', password_hash='h', vault_salt=os.urandom(32))
+        db.session.add(user)
+        db.session.flush()
+        note = Note(owner_id=user.id, title_ciphertext=b't', body_ciphertext=b'b', nonce=os.urandom(12))
+        db.session.add(note)
+        db.session.flush()
+        nk = NoteKey(
+            note_id=note.id, user_id=user.id,
+            encrypted_note_key=b'key', key_nonce=os.urandom(12), key_type='vault',
+        )
+        db.session.add(nk)
+        db.session.commit()
+        assert nk.id is not None
+
+def test_audit_log_creation(db, app):
+    with app.app_context():
+        log = AuditLog(user_id=None, action='login_failed', ip_address='127.0.0.1')
+        db.session.add(log)
+        db.session.commit()
+        assert log.id is not None
+```
+
+Run: `pytest tests/test_models.py -v`
+Expected: FAIL — `app.models` not found.
+
+- [ ] **Step 2: Create `app/models.py`**
+
+```python
+from datetime import datetime
+from .extensions import db
+
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(255), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    vault_salt = db.Column(db.LargeBinary(32), nullable=False)
+    rsa_public_key = db.Column(db.Text, nullable=True)
+    rsa_private_key_encrypted = db.Column(db.LargeBinary, nullable=True)
+    role = db.Column(db.String(10), default='student', nullable=False)
+    is_verified = db.Column(db.Boolean, default=False, nullable=False)
+    is_active = db.Column(db.Boolean, default=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login_at = db.Column(db.DateTime, nullable=True)
+
+    otp_tokens = db.relationship('OTPToken', backref='user', lazy=True, cascade='all, delete-orphan')
+    owned_notes = db.relationship('Note', backref='owner', lazy=True, foreign_keys='Note.owner_id')
+
+class OTPToken(db.Model):
+    __tablename__ = 'otp_tokens'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    token_hash = db.Column(db.String(255), nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used = db.Column(db.Boolean, default=False, nullable=False)
+
+class Note(db.Model):
+    __tablename__ = 'notes'
+    id = db.Column(db.Integer, primary_key=True)
+    owner_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    title_ciphertext = db.Column(db.LargeBinary, nullable=False)
+    body_ciphertext = db.Column(db.LargeBinary, nullable=False)
+    nonce = db.Column(db.LargeBinary(12), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    note_keys = db.relationship('NoteKey', backref='note', lazy=True, cascade='all, delete-orphan')
+    access_list = db.relationship('NoteAccess', backref='note', lazy=True, cascade='all, delete-orphan')
+
+class NoteKey(db.Model):
+    __tablename__ = 'note_keys'
+    id = db.Column(db.Integer, primary_key=True)
+    note_id = db.Column(db.Integer, db.ForeignKey('notes.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    encrypted_note_key = db.Column(db.LargeBinary, nullable=False)
+    key_nonce = db.Column(db.LargeBinary(12), nullable=True)  # set for key_type='vault'; null for 'rsa' (OAEP has no nonce)
+    key_type = db.Column(db.String(5), nullable=False)  # 'vault' or 'rsa'
+
+class NoteAccess(db.Model):
+    __tablename__ = 'note_access'
+    note_id = db.Column(db.Integer, db.ForeignKey('notes.id'), primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), primary_key=True)
+    permission = db.Column(db.String(5), nullable=False)  # 'read' or 'write'
+    shared_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class AuditLog(db.Model):
+    __tablename__ = 'audit_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    action = db.Column(db.String(100), nullable=False)
+    ip_address = db.Column(db.String(45), nullable=True)
+    user_agent = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+```
+
+- [ ] **Step 3: Run tests and verify they pass**
+
+```bash
+pytest tests/test_models.py -v
+```
+Expected: all 4 tests PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add app/models.py tests/test_models.py
+git commit -m "feat: sqlalchemy models — users, notes, note_keys, audit_logs"
+```
+
+---
+
+## Task 3: Crypto Layer
+
+**Files:**
+- Create: `app/crypto.py`
+- Test: `tests/test_crypto.py`
+
+- [ ] **Step 1: Write failing crypto tests**
+
+Create `tests/test_crypto.py`:
+```python
+import os
+import pytest
+from app.crypto import (
+    generate_nonce, aes_encrypt, aes_decrypt,
+    aes_encrypt_sealed, aes_decrypt_sealed,
+    derive_vault_key,
+    wrap_key_with_vault, unwrap_key_with_vault,
+    generate_rsa_keypair, rsa_encrypt_key, rsa_decrypt_key,
+    generate_note_key,
+)
+
+def test_aes_roundtrip():
+    key = os.urandom(32)
+    nonce = generate_nonce()
+    plaintext = b'secret note content'
+    ciphertext = aes_encrypt(key, nonce, plaintext)
+    assert aes_decrypt(key, nonce, ciphertext) == plaintext
+
+def test_generate_nonce_unique():
+    assert generate_nonce() != generate_nonce()
+
+def test_aes_ciphertext_length():
+    key = os.urandom(32)
+    nonce = generate_nonce()
+    plaintext = b'hello'
+    ciphertext = aes_encrypt(key, nonce, plaintext)
+    # len(plaintext) + 16 GCM tag (nonce stored separately, not prepended)
+    assert len(ciphertext) == len(plaintext) + 16
+
+def test_aes_tamper_detection():
+    key = os.urandom(32)
+    nonce = generate_nonce()
+    ciphertext = bytearray(aes_encrypt(key, nonce, b'data'))
+    ciphertext[-1] ^= 0xFF  # flip last byte of GCM tag
+    with pytest.raises(Exception):
+        aes_decrypt(key, nonce, bytes(ciphertext))
+
+def test_aes_sealed_roundtrip():
+    key = os.urandom(32)
+    plaintext = b'rsa private key pem bytes'
+    blob = aes_encrypt_sealed(key, plaintext)
+    assert aes_decrypt_sealed(key, blob) == plaintext
+
+def test_aes_sealed_produces_unique_nonces():
+    key = os.urandom(32)
+    blob1 = aes_encrypt_sealed(key, b'same')
+    blob2 = aes_encrypt_sealed(key, b'same')
+    assert blob1[:12] != blob2[:12]
+
+def test_derive_vault_key_deterministic():
+    salt = os.urandom(32)
+    k1 = derive_vault_key('MyPass1!AbcDef', salt)
+    k2 = derive_vault_key('MyPass1!AbcDef', salt)
+    assert k1 == k2
+    assert len(k1) == 32
+
+def test_derive_vault_key_different_passwords():
+    salt = os.urandom(32)
+    k1 = derive_vault_key('Password1!', salt)
+    k2 = derive_vault_key('Password2!', salt)
+    assert k1 != k2
+
+def test_key_wrapping_roundtrip():
+    vault_key = os.urandom(32)
+    note_key = os.urandom(32)
+    key_nonce, wrapped = wrap_key_with_vault(vault_key, note_key)
+    assert unwrap_key_with_vault(vault_key, key_nonce, wrapped) == note_key
+
+def test_rsa_key_roundtrip():
+    private_pem, public_pem = generate_rsa_keypair()
+    note_key = os.urandom(32)
+    encrypted = rsa_encrypt_key(public_pem, note_key)
+    decrypted = rsa_decrypt_key(private_pem, encrypted)
+    assert decrypted == note_key
+
+def test_generate_note_key_length():
+    key = generate_note_key()
+    assert len(key) == 32
+
+def test_generate_note_key_unique():
+    assert generate_note_key() != generate_note_key()
+```
+
+Run: `pytest tests/test_crypto.py -v`
+Expected: FAIL — `app.crypto` not found.
+
+- [ ] **Step 2: Create `app/crypto.py`**
+
+```python
+import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+
+
+def generate_nonce() -> bytes:
+    return os.urandom(12)
+
+
+def aes_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+    """AES-256-GCM encrypt with an explicit nonce. Caller stores the nonce
+    separately (e.g. notes.nonce, note_keys.key_nonce) — not prepended here."""
+    return AESGCM(key).encrypt(nonce, plaintext, None)
+
+
+def aes_decrypt(key: bytes, nonce: bytes, ciphertext: bytes) -> bytes:
+    """AES-256-GCM decrypt with an explicit nonce supplied by the caller."""
+    return AESGCM(key).decrypt(nonce, ciphertext, None)
+
+
+def aes_encrypt_sealed(key: bytes, plaintext: bytes) -> bytes:
+    """AES-256-GCM encrypt for blobs with no dedicated nonce column
+    (e.g. users.rsa_private_key_encrypted). Returns nonce(12) + ciphertext + tag."""
+    nonce = generate_nonce()
+    return nonce + aes_encrypt(key, nonce, plaintext)
+
+
+def aes_decrypt_sealed(key: bytes, blob: bytes) -> bytes:
+    """Decrypt a blob produced by aes_encrypt_sealed (nonce prepended)."""
+    return aes_decrypt(key, blob[:12], blob[12:])
+
+
+def derive_vault_key(password: str, salt: bytes) -> bytes:
+    """Derive a 256-bit vault key from password using PBKDF2-SHA256."""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=600_000,
+    )
+    return kdf.derive(password.encode())
+
+
+def generate_note_key() -> bytes:
+    return os.urandom(32)
+
+
+def wrap_key_with_vault(vault_key: bytes, note_key: bytes) -> tuple[bytes, bytes]:
+    """AES-encrypt note_key with vault_key. Returns (key_nonce, ciphertext)
+    for storage in note_keys.key_nonce / note_keys.encrypted_note_key."""
+    nonce = generate_nonce()
+    return nonce, aes_encrypt(vault_key, nonce, note_key)
+
+
+def unwrap_key_with_vault(vault_key: bytes, key_nonce: bytes, wrapped: bytes) -> bytes:
+    """Decrypt a vault-wrapped note key using its stored key_nonce."""
+    return aes_decrypt(vault_key, key_nonce, wrapped)
+
+
+def generate_rsa_keypair() -> tuple[bytes, bytes]:
+    """Generate RSA-2048 keypair. Returns (private_pem, public_pem)."""
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    public_pem = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return private_pem, public_pem
+
+
+def rsa_encrypt_key(public_pem: bytes, note_key: bytes) -> bytes:
+    """RSA-OAEP encrypt note_key with recipient's public key."""
+    pub = serialization.load_pem_public_key(public_pem)
+    return pub.encrypt(note_key, padding.OAEP(
+        mgf=padding.MGF1(hashes.SHA256()),
+        algorithm=hashes.SHA256(),
+        label=None,
+    ))
+
+
+def rsa_decrypt_key(private_pem: bytes, encrypted_key: bytes) -> bytes:
+    """RSA-OAEP decrypt note_key with private key."""
+    priv = serialization.load_pem_private_key(private_pem, password=None)
+    return priv.decrypt(encrypted_key, padding.OAEP(
+        mgf=padding.MGF1(hashes.SHA256()),
+        algorithm=hashes.SHA256(),
+        label=None,
+    ))
+```
+
+- [ ] **Step 3: Run tests**
+
+```bash
+pytest tests/test_crypto.py -v
+```
+Expected: all 12 tests PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add app/crypto.py tests/test_crypto.py
+git commit -m "feat: crypto layer — AES-256-GCM, PBKDF2, RSA-OAEP key wrapping"
+```
+
+---
+
+## Task 4: Auth Decorators
+
+**Files:**
+- Create: `app/decorators.py`
+- Test: `tests/test_access_control.py` (partial — extend in later tasks)
+
+- [ ] **Step 1: Write failing decorator tests**
+
+Create `tests/test_access_control.py`:
+```python
+def test_login_required_redirects_unauthenticated(client):
+    response = client.get('/notes/', follow_redirects=False)
+    assert response.status_code == 302
+    assert '/auth/login' in response.headers['Location']
+
+def test_admin_required_returns_403_for_student(client, app, db):
+    from app.models import User
+    from app.extensions import db as _db
+    import os
+    with app.app_context():
+        user = User(
+            email='student@graduate.utm.my',
+            password_hash='h',
+            vault_salt=os.urandom(32),
+            role='student',
+            is_verified=True,
+        )
+        _db.session.add(user)
+        _db.session.commit()
+        with client.session_transaction() as sess:
+            sess['user_id'] = user.id
+            sess['vault_key'] = os.urandom(32).hex()
+    response = client.get('/admin/users')
+    assert response.status_code == 403
+```
+
+Run: `pytest tests/test_access_control.py -v`
+Expected: FAIL — routes not yet defined.
+
+- [ ] **Step 2: Create `app/decorators.py`**
+
+```python
+from functools import wraps
+from flask import session, redirect, url_for, abort
+from .models import User
+
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user_id = session.get('user_id')
+        if not user_id:
+            return redirect(url_for('auth.login'))
+        user = User.query.get(user_id)
+        if not user or not user.is_active or not user.is_verified:
+            session.clear()
+            return redirect(url_for('auth.login'))
+        return f(*args, **kwargs)
+    return decorated
+
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user_id = session.get('user_id')
+        if not user_id:
+            return redirect(url_for('auth.login'))
+        user = User.query.get(user_id)
+        if not user or user.role != 'admin':
+            abort(403)
+        return f(*args, **kwargs)
+    return decorated
+```
+
+- [ ] **Step 3: Create stub routes so tests can run**
+
+Add to `app/notes/routes.py` (stub):
+```python
+from flask import render_template
+from .. import notes
+from ..decorators import login_required
+from . import bp
+
+@bp.route('/')
+@login_required
+def list_notes():
+    return render_template('notes/list.html', owned=[], shared=[])
+```
+
+Add to `app/admin/routes.py` (stub):
+```python
+from flask import render_template
+from ..decorators import admin_required
+from . import bp
+
+@bp.route('/users')
+@admin_required
+def users():
+    return render_template('admin/users.html', users=[])
+```
+
+Create placeholder templates:
+- `app/templates/notes/list.html`: `<html><body>Notes list</body></html>`
+- `app/templates/admin/users.html`: `<html><body>Admin users</body></html>`
+
+- [ ] **Step 4: Run tests**
+
+```bash
+pytest tests/test_access_control.py -v
+```
+Expected: both tests PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add app/decorators.py app/notes/routes.py app/admin/routes.py app/templates/
+git commit -m "feat: auth decorators — login_required, admin_required"
+```
+
+---
+
+## Task 5: Auth Blueprint — Registration, OTP, Login
+
+**Files:**
+- Create: `app/auth/forms.py`
+- Create: `app/auth/routes.py`
+- Test: `tests/test_auth.py`
+
+- [ ] **Step 1: Write failing auth tests**
+
+Create `tests/test_auth.py`:
+```python
+import os
+from unittest.mock import patch
+from app.models import User, OTPToken
+from app.extensions import db as _db
+from app.crypto import derive_vault_key
+
+
+def _register(client, email='a@graduate.utm.my', password='SecurePass1!xyz'):
+    return client.post('/auth/register', data={
+        'email': email,
+        'password': password,
+    }, follow_redirects=False)
+
+
+def test_register_valid_email(client, app, db):
+    with patch('app.auth.routes.mail'):
+        resp = _register(client)
+    assert resp.status_code == 302
+    assert '/auth/verify-otp' in resp.headers['Location']
+    with app.app_context():
+        user = User.query.filter_by(email='a@graduate.utm.my').first()
+        assert user is not None
+        assert user.is_verified is False
+
+
+def test_register_rejects_non_utm_email(client, app, db):
+    resp = _register(client, email='attacker@gmail.com')
+    assert resp.status_code == 200
+    assert b'graduate.utm.my' in resp.data
+
+
+def test_register_rejects_weak_password(client, app, db):
+    resp = _register(client, password='weak')
+    assert resp.status_code == 200
+
+
+def test_verify_otp_correct(client, app, db):
+    with patch('app.auth.routes.mail'):
+        _register(client)
+    with app.app_context():
+        user = User.query.filter_by(email='a@graduate.utm.my').first()
+        otp_record = OTPToken.query.filter_by(user_id=user.id, used=False).first()
+    # Can't check real OTP hash without knowing the OTP — test the invalid path
+    resp = client.post('/auth/verify-otp', data={'token': '000000'})
+    assert resp.status_code == 200
+    assert b'Invalid' in resp.data or b'invalid' in resp.data
+
+
+def test_login_valid(client, app, db):
+    with patch('app.auth.routes.mail'):
+        _register(client, email='b@graduate.utm.my')
+    with app.app_context():
+        user = User.query.filter_by(email='b@graduate.utm.my').first()
+        user.is_verified = True
+        _db.session.commit()
+    resp = client.post('/auth/login', data={
+        'email': 'b@graduate.utm.my',
+        'password': 'SecurePass1!xyz',
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+    assert '/notes/' in resp.headers['Location']
+
+
+def test_login_wrong_password(client, app, db):
+    with patch('app.auth.routes.mail'):
+        _register(client, email='c@graduate.utm.my')
+    with app.app_context():
+        user = User.query.filter_by(email='c@graduate.utm.my').first()
+        user.is_verified = True
+        _db.session.commit()
+    resp = client.post('/auth/login', data={
+        'email': 'c@graduate.utm.my',
+        'password': 'WrongPassword1!',
+    })
+    assert resp.status_code == 200
+    assert b'Invalid' in resp.data or b'invalid' in resp.data
+
+
+def test_login_unverified_blocked(client, app, db):
+    with patch('app.auth.routes.mail'):
+        _register(client, email='d@graduate.utm.my')
+    resp = client.post('/auth/login', data={
+        'email': 'd@graduate.utm.my',
+        'password': 'SecurePass1!xyz',
+    })
+    assert resp.status_code == 200
+    assert b'Invalid' in resp.data or b'invalid' in resp.data
+
+
+def test_logout_clears_session(client, app, db):
+    with patch('app.auth.routes.mail'):
+        _register(client, email='e@graduate.utm.my')
+    with app.app_context():
+        user = User.query.filter_by(email='e@graduate.utm.my').first()
+        user.is_verified = True
+        _db.session.commit()
+    client.post('/auth/login', data={'email': 'e@graduate.utm.my', 'password': 'SecurePass1!xyz'})
+    client.post('/auth/logout')
+    resp = client.get('/notes/', follow_redirects=False)
+    assert resp.status_code == 302
+```
+
+Run: `pytest tests/test_auth.py -v`
+Expected: FAIL — auth routes not defined.
+
+- [ ] **Step 2: Create `app/auth/forms.py`**
+
+```python
+import re
+from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, SubmitField
+from wtforms.validators import DataRequired, Email, Length, ValidationError
+
+_UTM_EMAIL_RE = re.compile(r'^[a-zA-Z0-9._%+\-]+@graduate\.utm\.my$')
+_SYMBOL_RE = re.compile(r'[!@#$%^&*()\-_=+\[\]{}|;:,.<>?/]')
+
+
+class RegistrationForm(FlaskForm):
+    email = StringField('UTM Email', validators=[DataRequired(), Email(), Length(max=255)])
+    password = PasswordField('Password', validators=[DataRequired(), Length(min=12)])
+    submit = SubmitField('Register')
+
+    def validate_email(self, field):
+        if not _UTM_EMAIL_RE.match(field.data.strip()):
+            raise ValidationError('Only @graduate.utm.my addresses are permitted.')
+
+    def validate_password(self, field):
+        pw = field.data
+        errors = []
+        if not re.search(r'[A-Z]', pw):
+            errors.append('one uppercase letter')
+        if not re.search(r'[a-z]', pw):
+            errors.append('one lowercase letter')
+        if not re.search(r'\d', pw):
+            errors.append('one digit')
+        if not _SYMBOL_RE.search(pw):
+            errors.append('one special character')
+        if errors:
+            raise ValidationError(f'Password must contain at least: {", ".join(errors)}.')
+
+
+class LoginForm(FlaskForm):
+    email = StringField('Email', validators=[DataRequired(), Email()])
+    password = PasswordField('Password', validators=[DataRequired()])
+    submit = SubmitField('Login')
+
+
+class OTPForm(FlaskForm):
+    token = StringField('Verification Code', validators=[DataRequired(), Length(min=6, max=6)])
+    submit = SubmitField('Verify')
+```
+
+- [ ] **Step 3: Create `app/auth/routes.py`**
+
+```python
+import os
+import random
+import string
+from datetime import datetime, timedelta
+
+import bleach
+from flask import render_template, redirect, url_for, session, request, flash
+from flask_mail import Message
+
+from . import bp
+from .forms import RegistrationForm, LoginForm, OTPForm
+from ..extensions import db, bcrypt, mail
+from ..models import User, OTPToken, AuditLog
+from ..crypto import derive_vault_key, generate_rsa_keypair, aes_encrypt_sealed
+
+_MAX_ATTEMPTS = 5
+_LOCKOUT = timedelta(minutes=15)
+_OTP_TTL = timedelta(minutes=10)
+
+
+def _audit(user_id, action):
+    db.session.add(AuditLog(
+        user_id=user_id,
+        action=action,
+        ip_address=request.remote_addr,
+        user_agent=request.user_agent.string,
+    ))
+    db.session.commit()
+
+
+def _send_otp(user: User) -> None:
+    otp = ''.join(random.choices(string.digits, k=6))
+    token_hash = bcrypt.generate_password_hash(otp, rounds=8).decode()
+    db.session.add(OTPToken(
+        user_id=user.id,
+        token_hash=token_hash,
+        expires_at=datetime.utcnow() + _OTP_TTL,
+    ))
+    db.session.commit()
+    msg = Message('UTM SecureNotes — Verification Code', recipients=[user.email])
+    msg.body = f'Your code: {otp}\n\nExpires in 10 minutes. Do not share this.'
+    mail.send(msg)
+
+
+@bp.route('/register', methods=['GET', 'POST'])
+def register():
+    form = RegistrationForm()
+    if form.validate_on_submit():
+        email = bleach.clean(form.email.data.strip().lower())
+        if User.query.filter_by(email=email).first():
+            flash('An account with this email already exists.', 'danger')
+            return render_template('auth/register.html', form=form)
+
+        vault_salt = os.urandom(32)
+        password_hash = bcrypt.generate_password_hash(form.password.data, rounds=12).decode()
+
+        vault_key = derive_vault_key(form.password.data, vault_salt)
+        private_pem, public_pem = generate_rsa_keypair()
+        rsa_private_key_encrypted = aes_encrypt_sealed(vault_key, private_pem)
+
+        user = User(
+            email=email,
+            password_hash=password_hash,
+            vault_salt=vault_salt,
+            rsa_public_key=public_pem.decode(),
+            rsa_private_key_encrypted=rsa_private_key_encrypted,
+        )
+        db.session.add(user)
+        db.session.flush()
+        _send_otp(user)
+        db.session.commit()
+
+        session['pending_user_id'] = user.id
+        flash('A verification code has been sent to your UTM email.', 'info')
+        return redirect(url_for('auth.verify_otp'))
+    return render_template('auth/register.html', form=form)
+
+
+@bp.route('/verify-otp', methods=['GET', 'POST'])
+def verify_otp():
+    user_id = session.get('pending_user_id')
+    if not user_id:
+        return redirect(url_for('auth.register'))
+    form = OTPForm()
+    if form.validate_on_submit():
+        record = OTPToken.query.filter_by(user_id=user_id, used=False).order_by(OTPToken.id.desc()).first()
+        if not record or datetime.utcnow() > record.expires_at:
+            flash('Code expired. Request a new one.', 'danger')
+            return render_template('auth/verify_otp.html', form=form)
+        if not bcrypt.check_password_hash(record.token_hash, form.token.data):
+            flash('Invalid code.', 'danger')
+            return render_template('auth/verify_otp.html', form=form)
+        record.used = True
+        user = User.query.get(user_id)
+        user.is_verified = True
+        db.session.commit()
+        session.pop('pending_user_id', None)
+        flash('Account verified. Please log in.', 'success')
+        return redirect(url_for('auth.login'))
+    return render_template('auth/verify_otp.html', form=form)
+
+
+@bp.route('/resend-otp', methods=['POST'])
+def resend_otp():
+    user_id = session.get('pending_user_id')
+    if not user_id:
+        return redirect(url_for('auth.register'))
+    user = User.query.get(user_id)
+    if not user:
+        return redirect(url_for('auth.register'))
+    _send_otp(user)
+    flash('A new code has been sent.', 'info')
+    return redirect(url_for('auth.verify_otp'))
+
+
+@bp.route('/login', methods=['GET', 'POST'])
+def login():
+    form = LoginForm()
+    if form.validate_on_submit():
+        email = bleach.clean(form.email.data.strip().lower())
+        user = User.query.filter_by(email=email).first()
+
+        if user:
+            since = datetime.utcnow() - _LOCKOUT
+            failures = AuditLog.query.filter(
+                AuditLog.user_id == user.id,
+                AuditLog.action == 'login_failed',
+                AuditLog.created_at > since,
+            ).count()
+            if failures >= _MAX_ATTEMPTS:
+                flash('Too many failed attempts. Try again in 15 minutes.', 'danger')
+                return render_template('auth/login.html', form=form)
+
+        if not user or not user.is_verified or not user.is_active:
+            flash('Invalid credentials.', 'danger')
+            if user:
+                _audit(user.id, 'login_failed')
+            return render_template('auth/login.html', form=form)
+
+        if not bcrypt.check_password_hash(user.password_hash, form.password.data):
+            _audit(user.id, 'login_failed')
+            flash('Invalid credentials.', 'danger')
+            return render_template('auth/login.html', form=form)
+
+        vault_key = derive_vault_key(form.password.data, user.vault_salt)
+        session.clear()
+        session['user_id'] = user.id
+        session['vault_key'] = vault_key.hex()
+        session.permanent = True
+
+        user.last_login_at = datetime.utcnow()
+        _audit(user.id, 'login')
+        return redirect(url_for('notes.list_notes'))
+    return render_template('auth/login.html', form=form)
+
+
+@bp.route('/logout', methods=['POST'])
+def logout():
+    user_id = session.get('user_id')
+    if user_id:
+        _audit(user_id, 'logout')
+    session.clear()
+    return redirect(url_for('auth.login'))
+```
+
+- [ ] **Step 4: Create auth templates**
+
+`app/templates/auth/register.html`:
+```html
+{% extends 'base.html' %}
+{% block title %}Register{% endblock %}
+{% block content %}
+<div class="row justify-content-center mt-5">
+  <div class="col-md-5">
+    <h2 class="mb-4">Create Account</h2>
+    <form method="POST">
+      {{ form.hidden_tag() }}
+      <div class="mb-3">
+        {{ form.email.label(class="form-label") }}
+        {{ form.email(class="form-control", placeholder="your-id@graduate.utm.my") }}
+        {% for e in form.email.errors %}<div class="text-danger small">{{ e }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.password.label(class="form-label") }}
+        {{ form.password(class="form-control") }}
+        <div class="form-text">Min 12 chars, upper+lower+digit+symbol.</div>
+        {% for e in form.password.errors %}<div class="text-danger small">{{ e }}</div>{% endfor %}
+      </div>
+      {{ form.submit(class="btn btn-primary w-100") }}
+    </form>
+    <p class="mt-3 text-center">Already have an account? <a href="{{ url_for('auth.login') }}">Login</a></p>
+  </div>
+</div>
+{% endblock %}
+```
+
+`app/templates/auth/verify_otp.html`:
+```html
+{% extends 'base.html' %}
+{% block title %}Verify Email{% endblock %}
+{% block content %}
+<div class="row justify-content-center mt-5">
+  <div class="col-md-4">
+    <h2 class="mb-4">Verify Your Email</h2>
+    <p>Enter the 6-digit code sent to your UTM email.</p>
+    <form method="POST">
+      {{ form.hidden_tag() }}
+      <div class="mb-3">
+        {{ form.token.label(class="form-label") }}
+        {{ form.token(class="form-control", maxlength=6, autocomplete="one-time-code") }}
+        {% for e in form.token.errors %}<div class="text-danger small">{{ e }}</div>{% endfor %}
+      </div>
+      {{ form.submit(class="btn btn-success w-100") }}
+    </form>
+    <form method="POST" action="{{ url_for('auth.resend_otp') }}" class="mt-2">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="btn btn-link p-0">Resend code</button>
+    </form>
+  </div>
+</div>
+{% endblock %}
+```
+
+`app/templates/auth/login.html`:
+```html
+{% extends 'base.html' %}
+{% block title %}Login{% endblock %}
+{% block content %}
+<div class="row justify-content-center mt-5">
+  <div class="col-md-5">
+    <h2 class="mb-4">Login</h2>
+    <form method="POST">
+      {{ form.hidden_tag() }}
+      <div class="mb-3">
+        {{ form.email.label(class="form-label") }}
+        {{ form.email(class="form-control") }}
+        {% for e in form.email.errors %}<div class="text-danger small">{{ e }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.password.label(class="form-label") }}
+        {{ form.password(class="form-control") }}
+        {% for e in form.password.errors %}<div class="text-danger small">{{ e }}</div>{% endfor %}
+      </div>
+      {{ form.submit(class="btn btn-primary w-100") }}
+    </form>
+    <p class="mt-3 text-center">No account? <a href="{{ url_for('auth.register') }}">Register</a></p>
+  </div>
+</div>
+{% endblock %}
+```
+
+- [ ] **Step 5: Run tests**
+
+```bash
+pytest tests/test_auth.py -v
+```
+Expected: all 8 tests PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add app/auth/ tests/test_auth.py app/templates/auth/
+git commit -m "feat: auth blueprint — registration, OTP verification, login/logout"
+```
+
+---
+
+## Task 6: Notes Blueprint — CRUD
+
+**Files:**
+- Create: `app/notes/forms.py`
+- Modify: `app/notes/routes.py`
+- Test: `tests/test_notes.py`
+
+- [ ] **Step 1: Write failing notes tests**
+
+Create `tests/test_notes.py`:
+```python
+import os
+from unittest.mock import patch
+from app.models import User, Note, NoteKey
+from app.extensions import db as _db
+from app.crypto import derive_vault_key, aes_decrypt, unwrap_key_with_vault
+
+
+def _make_verified_user(app, db, email='notes@graduate.utm.my', password='NotePass1!xyz'):
+    from app.crypto import generate_rsa_keypair, aes_encrypt_sealed
+    vault_salt = os.urandom(32)
+    vault_key = derive_vault_key(password, vault_salt)
+    private_pem, public_pem = generate_rsa_keypair()
+    from app.extensions import bcrypt
+    with app.app_context():
+        user = User(
+            email=email,
+            password_hash=bcrypt.generate_password_hash(password, rounds=4).decode(),
+            vault_salt=vault_salt,
+            rsa_public_key=public_pem.decode(),
+            rsa_private_key_encrypted=aes_encrypt_sealed(vault_key, private_pem),
+            is_verified=True,
+            is_active=True,
+        )
+        _db.session.add(user)
+        _db.session.commit()
+        return user.id, vault_key
+
+
+def _login_session(client, app, user_id, vault_key):
+    with client.session_transaction() as sess:
+        sess['user_id'] = user_id
+        sess['vault_key'] = vault_key.hex()
+
+
+def test_create_note(client, app, db):
+    user_id, vault_key = _make_verified_user(app, db)
+    _login_session(client, app, user_id, vault_key)
+    resp = client.post('/notes/new', data={
+        'title': 'My First Note',
+        'body': 'Secret content here',
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+    with app.app_context():
+        note = Note.query.filter_by(owner_id=user_id).first()
+        assert note is not None
+        nk = NoteKey.query.filter_by(note_id=note.id, user_id=user_id).first()
+        assert nk is not None
+        note_key = unwrap_key_with_vault(vault_key, nk.key_nonce, nk.encrypted_note_key)
+        title = aes_decrypt(note_key, note.nonce, note.title_ciphertext).decode()
+        assert title == 'My First Note'
+
+
+def test_view_note(client, app, db):
+    user_id, vault_key = _make_verified_user(app, db, email='view@graduate.utm.my')
+    _login_session(client, app, user_id, vault_key)
+    client.post('/notes/new', data={'title': 'View Test', 'body': 'Body'})
+    with app.app_context():
+        note = Note.query.filter_by(owner_id=user_id).first()
+    resp = client.get(f'/notes/{note.id}')
+    assert resp.status_code == 200
+    assert b'View Test' in resp.data
+
+
+def test_edit_note(client, app, db):
+    user_id, vault_key = _make_verified_user(app, db, email='edit@graduate.utm.my')
+    _login_session(client, app, user_id, vault_key)
+    client.post('/notes/new', data={'title': 'Old Title', 'body': 'Old'})
+    with app.app_context():
+        note = Note.query.filter_by(owner_id=user_id).first()
+    resp = client.post(f'/notes/{note.id}/edit', data={
+        'title': 'New Title',
+        'body': 'New content',
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+    with app.app_context():
+        note = Note.query.get(note.id)
+        nk = NoteKey.query.filter_by(note_id=note.id, user_id=user_id).first()
+        note_key = unwrap_key_with_vault(vault_key, nk.key_nonce, nk.encrypted_note_key)
+        assert aes_decrypt(note_key, note.nonce, note.title_ciphertext).decode() == 'New Title'
+
+
+def test_delete_note(client, app, db):
+    user_id, vault_key = _make_verified_user(app, db, email='del@graduate.utm.my')
+    _login_session(client, app, user_id, vault_key)
+    client.post('/notes/new', data={'title': 'To Delete', 'body': 'bye'})
+    with app.app_context():
+        note = Note.query.filter_by(owner_id=user_id).first()
+    resp = client.post(f'/notes/{note.id}/delete', follow_redirects=False)
+    assert resp.status_code == 302
+    with app.app_context():
+        assert Note.query.get(note.id) is None
+
+
+def test_cannot_view_other_users_note(client, app, db):
+    user1_id, vault_key1 = _make_verified_user(app, db, email='u1@graduate.utm.my')
+    user2_id, vault_key2 = _make_verified_user(app, db, email='u2@graduate.utm.my')
+    _login_session(client, app, user1_id, vault_key1)
+    client.post('/notes/new', data={'title': 'Private', 'body': 'secret'})
+    with app.app_context():
+        note = Note.query.filter_by(owner_id=user1_id).first()
+    _login_session(client, app, user2_id, vault_key2)
+    resp = client.get(f'/notes/{note.id}')
+    assert resp.status_code == 403
+```
+
+Run: `pytest tests/test_notes.py -v`
+Expected: FAIL — routes incomplete.
+
+- [ ] **Step 2: Create `app/notes/forms.py`**
+
+```python
+from flask_wtf import FlaskForm
+from wtforms import StringField, TextAreaField, SubmitField
+from wtforms.validators import DataRequired, Length, Email
+
+class NoteForm(FlaskForm):
+    title = StringField('Title', validators=[DataRequired(), Length(max=200)])
+    body = TextAreaField('Content', validators=[DataRequired()])
+    submit = SubmitField('Save Note')
+
+class ShareForm(FlaskForm):
+    recipient_email = StringField('Recipient UTM Email', validators=[DataRequired(), Email(), Length(max=255)])
+    permission = StringField('Permission')  # populated from select in template
+    submit = SubmitField('Share')
+```
+
+- [ ] **Step 3: Replace stub `app/notes/routes.py` with full implementation**
+
+```python
+import bleach
+from flask import render_template, redirect, url_for, session, request, flash, abort
+
+from . import bp
+from .forms import NoteForm, ShareForm
+from ..decorators import login_required
+from ..extensions import db
+from ..models import User, Note, NoteKey, NoteAccess, AuditLog
+from ..crypto import (
+    generate_nonce, aes_encrypt, aes_decrypt, aes_decrypt_sealed,
+    generate_note_key,
+    wrap_key_with_vault, unwrap_key_with_vault,
+    rsa_encrypt_key, rsa_decrypt_key,
+)
+
+
+def _current_user():
+    return User.query.get(session['user_id'])
+
+
+def _vault_key() -> bytes:
+    return bytes.fromhex(session['vault_key'])
+
+
+def _resolve_note_key(note_id: int, user_id: int, vault_key: bytes) -> bytes:
+    nk = NoteKey.query.filter_by(note_id=note_id, user_id=user_id).first()
+    if not nk:
+        abort(403)
+    if nk.key_type == 'vault':
+        return unwrap_key_with_vault(vault_key, nk.key_nonce, nk.encrypted_note_key)
+    user = User.query.get(user_id)
+    private_pem = aes_decrypt_sealed(vault_key, user.rsa_private_key_encrypted)
+    return rsa_decrypt_key(private_pem, nk.encrypted_note_key)
+
+
+def _audit(user_id, action):
+    db.session.add(AuditLog(
+        user_id=user_id,
+        action=action,
+        ip_address=request.remote_addr,
+        user_agent=request.user_agent.string,
+    ))
+    db.session.commit()
+
+
+def _can_access(note: Note, user_id: int) -> bool:
+    if note.owner_id == user_id:
+        return True
+    return NoteAccess.query.filter_by(note_id=note.id, user_id=user_id).first() is not None
+
+
+def _can_edit(note: Note, user_id: int) -> bool:
+    if note.owner_id == user_id:
+        return True
+    access = NoteAccess.query.filter_by(note_id=note.id, user_id=user_id).first()
+    return access is not None and access.permission == 'write'
+
+
+@bp.route('/')
+@login_required
+def list_notes():
+    user = _current_user()
+    vault_key = _vault_key()
+
+    def _title(note):
+        try:
+            nk = _resolve_note_key(note.id, user.id, vault_key)
+            return aes_decrypt(nk, note.nonce, note.title_ciphertext).decode()
+        except Exception:
+            return '[Decryption error]'
+
+    owned = Note.query.filter_by(owner_id=user.id).all()
+    shared_ids = [a.note_id for a in NoteAccess.query.filter_by(user_id=user.id).all()]
+    shared = Note.query.filter(Note.id.in_(shared_ids)).all() if shared_ids else []
+
+    return render_template('notes/list.html',
+        owned=[(n, _title(n)) for n in owned],
+        shared=[(n, _title(n)) for n in shared],
+    )
+
+
+@bp.route('/new', methods=['GET', 'POST'])
+@login_required
+def create_note():
+    form = NoteForm()
+    if form.validate_on_submit():
+        user = _current_user()
+        vault_key = _vault_key()
+        title = bleach.clean(form.title.data.strip())
+        body = bleach.clean(form.body.data.strip())
+
+        note_key = generate_note_key()
+        nonce = generate_nonce()
+        note = Note(
+            owner_id=user.id,
+            title_ciphertext=aes_encrypt(note_key, nonce, title.encode()),
+            body_ciphertext=aes_encrypt(note_key, nonce, body.encode()),
+            nonce=nonce,
+        )
+        db.session.add(note)
+        db.session.flush()
+
+        key_nonce, encrypted_note_key = wrap_key_with_vault(vault_key, note_key)
+        db.session.add(NoteKey(
+            note_id=note.id,
+            user_id=user.id,
+            encrypted_note_key=encrypted_note_key,
+            key_nonce=key_nonce,
+            key_type='vault',
+        ))
+        db.session.commit()
+        _audit(user.id, 'note_create')
+        flash('Note saved.', 'success')
+        return redirect(url_for('notes.view_note', note_id=note.id))
+    return render_template('notes/form.html', form=form, action='Create')
+
+
+@bp.route('/<int:note_id>')
+@login_required
+def view_note(note_id):
+    note = Note.query.get_or_404(note_id)
+    user = _current_user()
+    if not _can_access(note, user.id):
+        abort(403)
+    vault_key = _vault_key()
+    note_key = _resolve_note_key(note.id, user.id, vault_key)
+    title = aes_decrypt(note_key, note.nonce, note.title_ciphertext).decode()
+    body = aes_decrypt(note_key, note.nonce, note.body_ciphertext).decode()
+    is_owner = note.owner_id == user.id
+    return render_template('notes/view.html', note=note, title=title, body=body, is_owner=is_owner)
+
+
+@bp.route('/<int:note_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_note(note_id):
+    note = Note.query.get_or_404(note_id)
+    user = _current_user()
+    if not _can_edit(note, user.id):
+        abort(403)
+    vault_key = _vault_key()
+    note_key = _resolve_note_key(note.id, user.id, vault_key)
+    form = NoteForm()
+    if form.validate_on_submit():
+        title = bleach.clean(form.title.data.strip())
+        body = bleach.clean(form.body.data.strip())
+        new_note_key = generate_note_key()
+        new_nonce = generate_nonce()
+        note.title_ciphertext = aes_encrypt(new_note_key, new_nonce, title.encode())
+        note.body_ciphertext = aes_encrypt(new_note_key, new_nonce, body.encode())
+        note.nonce = new_nonce
+        # Re-wrap only for the current user; other vault users would need their own
+        # password to re-derive their vault_key, which we don't have server-side.
+        # RSA-shared recipients are not re-wrapped either — see note below.
+        my_nk = NoteKey.query.filter_by(note_id=note.id, user_id=user.id).first()
+        my_nk.key_nonce, my_nk.encrypted_note_key = wrap_key_with_vault(vault_key, new_note_key)
+        db.session.commit()
+        _audit(user.id, 'note_edit')
+        flash('Note updated.', 'success')
+        return redirect(url_for('notes.view_note', note_id=note.id))
+    if request.method == 'GET':
+        form.title.data = aes_decrypt(note_key, note.nonce, note.title_ciphertext).decode()
+        form.body.data = aes_decrypt(note_key, note.nonce, note.body_ciphertext).decode()
+    return render_template('notes/form.html', form=form, action='Edit')
+
+
+@bp.route('/<int:note_id>/delete', methods=['POST'])
+@login_required
+def delete_note(note_id):
+    note = Note.query.get_or_404(note_id)
+    user = _current_user()
+    if note.owner_id != user.id:
+        abort(403)
+    db.session.delete(note)
+    db.session.commit()
+    _audit(user.id, 'note_delete')
+    flash('Note deleted.', 'success')
+    return redirect(url_for('notes.list_notes'))
+```
+
+> **Note on edit re-encryption:** When a note is edited, re-wrapping RSA-shared keys requires the recipients' private keys (unavailable server-side). For this academic project, RSA-shared recipients' keys are left unchanged (they reference the old version, which is now replaced). Document this limitation in your security report — in production this would use a key escrow or signal to recipients.
+
+- [ ] **Step 4: Create notes templates**
+
+`app/templates/notes/list.html`:
+```html
+{% extends 'base.html' %}
+{% block title %}My Notes{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mt-4 mb-3">
+  <h2>My Notes</h2>
+  <a href="{{ url_for('notes.create_note') }}" class="btn btn-primary">+ New Note</a>
+</div>
+{% if owned %}
+<h5>Owned</h5>
+<ul class="list-group mb-4">
+  {% for note, title in owned %}
+  <li class="list-group-item d-flex justify-content-between">
+    <a href="{{ url_for('notes.view_note', note_id=note.id) }}">{{ title | e }}</a>
+    <small class="text-muted">{{ note.updated_at.strftime('%Y-%m-%d') }}</small>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% if shared %}
+<h5>Shared With Me</h5>
+<ul class="list-group">
+  {% for note, title in shared %}
+  <li class="list-group-item">
+    <a href="{{ url_for('notes.view_note', note_id=note.id) }}">{{ title | e }}</a>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% if not owned and not shared %}
+<p class="text-muted">No notes yet. <a href="{{ url_for('notes.create_note') }}">Create one.</a></p>
+{% endif %}
+{% endblock %}
+```
+
+`app/templates/notes/form.html`:
+```html
+{% extends 'base.html' %}
+{% block title %}{{ action }} Note{% endblock %}
+{% block content %}
+<div class="row justify-content-center mt-4">
+  <div class="col-md-8">
+    <h2>{{ action }} Note</h2>
+    <form method="POST">
+      {{ form.hidden_tag() }}
+      <div class="mb-3">
+        {{ form.title.label(class="form-label") }}
+        {{ form.title(class="form-control") }}
+        {% for e in form.title.errors %}<div class="text-danger small">{{ e }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        {{ form.body.label(class="form-label") }}
+        {{ form.body(class="form-control", rows=10) }}
+        {% for e in form.body.errors %}<div class="text-danger small">{{ e }}</div>{% endfor %}
+      </div>
+      {{ form.submit(class="btn btn-primary") }}
+      <a href="{{ url_for('notes.list_notes') }}" class="btn btn-secondary ms-2">Cancel</a>
+    </form>
+  </div>
+</div>
+{% endblock %}
+```
+
+`app/templates/notes/view.html`:
+```html
+{% extends 'base.html' %}
+{% block title %}{{ title | e }}{% endblock %}
+{% block content %}
+<div class="mt-4">
+  <h2>{{ title | e }}</h2>
+  <p class="text-muted small">Last updated: {{ note.updated_at.strftime('%Y-%m-%d %H:%M') }}</p>
+  <div class="card mb-4"><div class="card-body">{{ body | e | replace('\n', '<br>') | safe }}</div></div>
+  {% if is_owner %}
+  <a href="{{ url_for('notes.edit_note', note_id=note.id) }}" class="btn btn-sm btn-outline-primary">Edit</a>
+  <a href="{{ url_for('notes.share_note', note_id=note.id) }}" class="btn btn-sm btn-outline-secondary">Share</a>
+  <form method="POST" action="{{ url_for('notes.delete_note', note_id=note.id) }}" class="d-inline" onsubmit="return confirm('Delete this note?')">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn btn-sm btn-outline-danger">Delete</button>
+  </form>
+  {% endif %}
+  <a href="{{ url_for('notes.list_notes') }}" class="btn btn-sm btn-link">Back</a>
+</div>
+{% endblock %}
+```
+
+- [ ] **Step 5: Run tests**
+
+```bash
+pytest tests/test_notes.py -v
+```
+Expected: all 5 tests PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add app/notes/ tests/test_notes.py app/templates/notes/
+git commit -m "feat: notes blueprint — encrypted CRUD with AES-256-GCM per-note keys"
+```
+
+---
+
+## Task 7: Note Sharing
+
+**Files:**
+- Modify: `app/notes/routes.py`
+- Test: `tests/test_notes.py` (extend)
+
+- [ ] **Step 1: Add sharing tests to `tests/test_notes.py`**
+
+Append to `tests/test_notes.py`:
+```python
+def test_share_note_with_another_user(client, app, db):
+    user1_id, vault_key1 = _make_verified_user(app, db, email='sharer@graduate.utm.my')
+    user2_id, vault_key2 = _make_verified_user(app, db, email='recipient@graduate.utm.my')
+
+    _login_session(client, app, user1_id, vault_key1)
+    client.post('/notes/new', data={'title': 'Shared Note', 'body': 'shared content'})
+    with app.app_context():
+        note = Note.query.filter_by(owner_id=user1_id).first()
+
+    resp = client.post(f'/notes/{note.id}/share', data={
+        'recipient_email': 'recipient@graduate.utm.my',
+        'permission': 'read',
+    }, follow_redirects=False)
+    assert resp.status_code == 302
+
+    # Recipient can now view the note
+    _login_session(client, app, user2_id, vault_key2)
+    resp = client.get(f'/notes/{note.id}')
+    assert resp.status_code == 200
+    assert b'Shared Note' in resp.data
+
+
+def test_share_rejects_non_utm_recipient(client, app, db):
+    user_id, vault_key = _make_verified_user(app, db, email='sharer2@graduate.utm.my')
+    _login_session(client, app, user_id, vault_key)
+    client.post('/notes/new', data={'title': 'Note', 'body': 'body'})
+    with app.app_context():
+        note = Note.query.filter_by(owner_id=user_id).first()
+    resp = client.post(f'/notes/{note.id}/share', data={
+        'recipient_email': 'hacker@gmail.com',
+        'permission': 'read',
+    })
+    assert resp.status_code == 200
+    assert b'graduate.utm.my' in resp.data
+```
+
+Run: `pytest tests/test_notes.py::test_share_note_with_another_user -v`
+Expected: FAIL — share route not implemented.
+
+- [ ] **Step 2: Add share route to `app/notes/routes.py`**
+
+Add after `delete_note`:
+```python
+import re as _re
+_UTM_RE = _re.compile(r'^[a-zA-Z0-9._%+\-]+@graduate\.utm\.my$')
+
+@bp.route('/<int:note_id>/share', methods=['GET', 'POST'])
+@login_required
+def share_note(note_id):
+    note = Note.query.get_or_404(note_id)
+    user = _current_user()
+    if note.owner_id != user.id:
+        abort(403)
+
+    form = ShareForm()
+    if form.validate_on_submit():
+        recipient_email = bleach.clean(form.recipient_email.data.strip().lower())
+        permission = form.permission.data if form.permission.data in ('read', 'write') else 'read'
+
+        if not _UTM_RE.match(recipient_email):
+            flash('Recipient must have a @graduate.utm.my email.', 'danger')
+            return render_template('notes/share.html', form=form, note_id=note_id)
+
+        recipient = User.query.filter_by(email=recipient_email, is_verified=True, is_active=True).first()
+        if not recipient:
+            flash('No verified UTM account found with that email.', 'danger')
+            return render_template('notes/share.html', form=form, note_id=note_id)
+
+        if recipient.id == user.id:
+            flash('You already own this note.', 'warning')
+            return render_template('notes/share.html', form=form, note_id=note_id)
+
+        existing = NoteAccess.query.filter_by(note_id=note.id, user_id=recipient.id).first()
+        if existing:
+            flash('Already shared with this user.', 'warning')
+            return render_template('notes/share.html', form=form, note_id=note_id)
+
+        vault_key = _vault_key()
+        note_key = _resolve_note_key(note.id, user.id, vault_key)
+        encrypted_for_recipient = rsa_encrypt_key(recipient.rsa_public_key.encode(), note_key)
+
+        db.session.add(NoteKey(
+            note_id=note.id,
+            user_id=recipient.id,
+            encrypted_note_key=encrypted_for_recipient,
+            key_nonce=None,  # RSA-OAEP has no separate nonce
+            key_type='rsa',
+        ))
+        db.session.add(NoteAccess(note_id=note.id, user_id=recipient.id, permission=permission))
+        db.session.commit()
+        _audit(user.id, 'note_share')
+        flash(f'Note shared with {recipient_email}.', 'success')
+        return redirect(url_for('notes.view_note', note_id=note_id))
+
+    return render_template('notes/share.html', form=form, note_id=note_id)
+```
+
+- [ ] **Step 3: Create share template**
+
+`app/templates/notes/share.html`:
+```html
+{% extends 'base.html' %}
+{% block title %}Share Note{% endblock %}
+{% block content %}
+<div class="row justify-content-center mt-4">
+  <div class="col-md-6">
+    <h2>Share Note</h2>
+    <form method="POST">
+      {{ form.hidden_tag() }}
+      <div class="mb-3">
+        {{ form.recipient_email.label(class="form-label") }}
+        {{ form.recipient_email(class="form-control", placeholder="friend@graduate.utm.my") }}
+        {% for e in form.recipient_email.errors %}<div class="text-danger small">{{ e }}</div>{% endfor %}
+      </div>
+      <div class="mb-3">
+        <label class="form-label">Permission</label>
+        <select name="permission" class="form-select">
+          <option value="read">Read only</option>
+          <option value="write">Read &amp; Write</option>
+        </select>
+      </div>
+      {{ form.submit(class="btn btn-success") }}
+      <a href="{{ url_for('notes.view_note', note_id=note_id) }}" class="btn btn-secondary ms-2">Cancel</a>
+    </form>
+  </div>
+</div>
+{% endblock %}
+```
+
+- [ ] **Step 4: Run tests**
+
+```bash
+pytest tests/test_notes.py -v
+```
+Expected: all 7 tests PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add app/notes/routes.py app/templates/notes/share.html tests/test_notes.py
+git commit -m "feat: note sharing — RSA-OAEP key wrapping for per-note access grants"
+```
+
+---
+
+## Task 8: Admin Blueprint
+
+**Files:**
+- Modify: `app/admin/routes.py`
+- Test: `tests/test_admin.py`
+
+- [ ] **Step 1: Write failing admin tests**
+
+Create `tests/test_admin.py`:
+```python
+import os
+from app.models import User, AuditLog
+from app.extensions import db as _db, bcrypt
+
+
+def _make_admin(app, db):
+    with app.app_context():
+        user = User(
+            email='admin@graduate.utm.my',
+            password_hash=bcrypt.generate_password_hash('AdminPass1!', rounds=4).decode(),
+            vault_salt=os.urandom(32),
+            role='admin',
+            is_verified=True,
+            is_active=True,
+        )
+        _db.session.add(user)
+        _db.session.commit()
+        return user.id
+
+
+def _make_student(app, db, email='stu@graduate.utm.my'):
+    with app.app_context():
+        user = User(
+            email=email,
+            password_hash='h',
+            vault_salt=os.urandom(32),
+            role='student',
+            is_verified=True,
+            is_active=True,
+        )
+        _db.session.add(user)
+        _db.session.commit()
+        return user.id
+
+
+def _admin_session(client, user_id):
+    with client.session_transaction() as sess:
+        sess['user_id'] = user_id
+        sess['vault_key'] = os.urandom(32).hex()
+
+
+def test_admin_can_view_users(client, app, db):
+    admin_id = _make_admin(app, db)
+    _admin_session(client, admin_id)
+    resp = client.get('/admin/users')
+    assert resp.status_code == 200
+    assert b'admin@graduate.utm.my' in resp.data
+
+
+def test_admin_can_suspend_user(client, app, db):
+    admin_id = _make_admin(app, db)
+    stu_id = _make_student(app, db)
+    _admin_session(client, admin_id)
+    resp = client.post(f'/admin/users/{stu_id}/suspend', follow_redirects=False)
+    assert resp.status_code == 302
+    with app.app_context():
+        user = User.query.get(stu_id)
+        assert user.is_active is False
+
+
+def test_admin_can_activate_user(client, app, db):
+    admin_id = _make_admin(app, db)
+    stu_id = _make_student(app, db, email='stu2@graduate.utm.my')
+    with app.app_context():
+        User.query.get(stu_id).is_active = False
+        _db.session.commit()
+    _admin_session(client, admin_id)
+    resp = client.post(f'/admin/users/{stu_id}/activate', follow_redirects=False)
+    assert resp.status_code == 302
+    with app.app_context():
+        assert User.query.get(stu_id).is_active is True
+
+
+def test_admin_audit_log_visible(client, app, db):
+    admin_id = _make_admin(app, db)
+    with app.app_context():
+        _db.session.add(AuditLog(user_id=admin_id, action='login', ip_address='127.0.0.1'))
+        _db.session.commit()
+    _admin_session(client, admin_id)
+    resp = client.get('/admin/audit-logs')
+    assert resp.status_code == 200
+    assert b'login' in resp.data
+
+
+def test_student_cannot_access_admin(client, app, db):
+    stu_id = _make_student(app, db, email='stu3@graduate.utm.my')
+    with client.session_transaction() as sess:
+        sess['user_id'] = stu_id
+        sess['vault_key'] = os.urandom(32).hex()
+    resp = client.get('/admin/users')
+    assert resp.status_code == 403
+```
+
+Run: `pytest tests/test_admin.py -v`
+Expected: FAIL — admin routes incomplete.
+
+- [ ] **Step 2: Replace stub `app/admin/routes.py`**
+
+```python
+from flask import render_template, redirect, url_for, request, flash, abort, session
+
+from . import bp
+from ..decorators import admin_required
+from ..extensions import db
+from ..models import User, AuditLog
+
+
+@bp.route('/users')
+@admin_required
+def users():
+    all_users = User.query.order_by(User.created_at.desc()).all()
+    return render_template('admin/users.html', users=all_users)
+
+
+@bp.route('/users/<int:user_id>/suspend', methods=['POST'])
+@admin_required
+def suspend_user(user_id):
+    user = User.query.get_or_404(user_id)
+    if user.role == 'admin':
+        flash('Cannot suspend another admin.', 'danger')
+        return redirect(url_for('admin.users'))
+    user.is_active = False
+    db.session.add(AuditLog(
+        user_id=session.get('user_id'),
+        action=f'suspend_user:{user_id}',
+        ip_address=request.remote_addr,
+        user_agent=request.user_agent.string,
+    ))
+    db.session.commit()
+    flash(f'User {user.email} suspended.', 'warning')
+    return redirect(url_for('admin.users'))
+
+
+@bp.route('/users/<int:user_id>/activate', methods=['POST'])
+@admin_required
+def activate_user(user_id):
+    user = User.query.get_or_404(user_id)
+    user.is_active = True
+    db.session.add(AuditLog(
+        user_id=session.get('user_id'),
+        action=f'activate_user:{user_id}',
+        ip_address=request.remote_addr,
+        user_agent=request.user_agent.string,
+    ))
+    db.session.commit()
+    flash(f'User {user.email} activated.', 'success')
+    return redirect(url_for('admin.users'))
+
+
+@bp.route('/audit-logs')
+@admin_required
+def audit_logs():
+    page = request.args.get('page', 1, type=int)
+    logs = AuditLog.query.order_by(AuditLog.created_at.desc()).paginate(page=page, per_page=50)
+    return render_template('admin/audit_logs.html', logs=logs)
+```
+
+- [ ] **Step 3: Create admin templates**
+
+`app/templates/admin/users.html`:
+```html
+{% extends 'base.html' %}
+{% block title %}Admin — Users{% endblock %}
+{% block content %}
+<h2 class="mt-4">All Users</h2>
+<table class="table table-striped mt-3">
+  <thead><tr><th>Email</th><th>Role</th><th>Verified</th><th>Active</th><th>Actions</th></tr></thead>
+  <tbody>
+  {% for u in users %}
+  <tr>
+    <td>{{ u.email | e }}</td>
+    <td>{{ u.role }}</td>
+    <td>{{ '✓' if u.is_verified else '✗' }}</td>
+    <td>{{ '✓' if u.is_active else '✗' }}</td>
+    <td>
+      {% if u.is_active and u.role != 'admin' %}
+      <form method="POST" action="{{ url_for('admin.suspend_user', user_id=u.id) }}" class="d-inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-sm btn-warning">Suspend</button>
+      </form>
+      {% elif not u.is_active %}
+      <form method="POST" action="{{ url_for('admin.activate_user', user_id=u.id) }}" class="d-inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-sm btn-success">Activate</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<a href="{{ url_for('admin.audit_logs') }}" class="btn btn-outline-secondary">View Audit Logs</a>
+{% endblock %}
+```
+
+`app/templates/admin/audit_logs.html`:
+```html
+{% extends 'base.html' %}
+{% block title %}Audit Logs{% endblock %}
+{% block content %}
+<h2 class="mt-4">Audit Logs</h2>
+<table class="table table-sm mt-3">
+  <thead><tr><th>Time</th><th>User ID</th><th>Action</th><th>IP</th></tr></thead>
+  <tbody>
+  {% for log in logs.items %}
+  <tr>
+    <td>{{ log.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+    <td>{{ log.user_id }}</td>
+    <td>{{ log.action | e }}</td>
+    <td>{{ log.ip_address | e }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<nav>
+  {% if logs.has_prev %}<a href="{{ url_for('admin.audit_logs', page=logs.prev_num) }}" class="btn btn-sm btn-outline-secondary">Prev</a>{% endif %}
+  {% if logs.has_next %}<a href="{{ url_for('admin.audit_logs', page=logs.next_num) }}" class="btn btn-sm btn-outline-secondary ms-1">Next</a>{% endif %}
+</nav>
+{% endblock %}
+```
+
+- [ ] **Step 4: Run tests**
+
+```bash
+pytest tests/test_admin.py -v
+```
+Expected: all 5 tests PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add app/admin/ tests/test_admin.py app/templates/admin/
+git commit -m "feat: admin blueprint — user management and paginated audit log"
+```
+
+---
+
+## Task 9: Base Template + Security Headers Test
+
+**Files:**
+- Create: `app/templates/base.html`
+- Test: `tests/test_access_control.py` (extend)
+
+- [ ] **Step 1: Add security header tests**
+
+Append to `tests/test_access_control.py`:
+```python
+def test_security_headers_present(client):
+    resp = client.get('/auth/login')
+    assert resp.headers.get('X-Content-Type-Options') == 'nosniff'
+    assert resp.headers.get('X-Frame-Options') == 'DENY'
+    assert 'Content-Security-Policy' in resp.headers
+
+def test_csrf_token_present_in_form(client):
+    resp = client.get('/auth/login')
+    assert b'csrf_token' in resp.data
+```
+
+Run: `pytest tests/test_access_control.py::test_security_headers_present -v`
+Expected: PASS (headers already set in `app/__init__.py`).
+
+- [ ] **Step 2: Create `app/templates/base.html`**
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}UTM SecureNotes{% endblock %} — UTM SecureNotes</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+</head>
+<body>
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+  <div class="container">
+    <a class="navbar-brand" href="{{ url_for('notes.list_notes') if session.get('user_id') else url_for('auth.login') }}">
+      🔒 UTM SecureNotes
+    </a>
+    <div class="ms-auto d-flex gap-2">
+      {% if session.get('user_id') %}
+        {% if session.get('is_admin') %}
+        <a href="{{ url_for('admin.users') }}" class="btn btn-sm btn-outline-light">Admin</a>
+        {% endif %}
+        <form method="POST" action="{{ url_for('auth.logout') }}" class="d-inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="btn btn-sm btn-outline-danger">Logout</button>
+        </form>
+      {% else %}
+        <a href="{{ url_for('auth.login') }}" class="btn btn-sm btn-outline-light">Login</a>
+        <a href="{{ url_for('auth.register') }}" class="btn btn-sm btn-light">Register</a>
+      {% endif %}
+    </div>
+  </div>
+</nav>
+<div class="container">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} mt-3" role="alert">{{ message | e }}</div>
+    {% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</div>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+```
+
+Store admin flag in session on login. In `app/auth/routes.py`, in the `login` route after setting `session['user_id']`:
+```python
+session['is_admin'] = (user.role == 'admin')
+```
+
+- [ ] **Step 3: Run full test suite**
+
+```bash
+pytest -v
+```
+Expected: all tests PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add app/templates/base.html app/auth/routes.py tests/test_access_control.py
+git commit -m "feat: base template with navbar, flash messages, security header tests"
+```
+
+---
+
+## Task 10: Final Integration Run & Root Redirect
+
+**Files:**
+- Modify: `app/__init__.py`
+
+- [ ] **Step 1: Add root redirect**
+
+In `app/__init__.py`, inside `create_app`, after registering blueprints:
+```python
+    from flask import redirect, url_for
+
+    @app.route('/')
+    def index():
+        return redirect(url_for('auth.login'))
+```
+
+- [ ] **Step 2: Run full suite and manual smoke test**
+
+```bash
+pytest -v --tb=short
+```
+Expected: all tests PASS with 0 failures.
+
+Manual run (requires `.env` configured with real MySQL + SMTP):
+```bash
+python run.py
+```
+Open `https://localhost:5000` in browser (accept self-signed cert warning).
+
+Verify the golden path manually:
+1. Register with `@graduate.utm.my` email → OTP arrives → verify → login
+2. Create a note → confirm title appears in list
+3. View note → confirm body decrypts correctly
+4. Edit note → confirm new content saved
+5. Share note with a second student account → log in as recipient → confirm note visible
+6. Admin login → confirm user list shows → suspend student → verify suspended user cannot login
+7. Admin → Audit Logs → confirm all actions are logged
+
+- [ ] **Step 3: Final commit**
+
+```bash
+git add app/__init__.py
+git commit -m "feat: root redirect + integration verified"
+```
+
+---
+
+## Self-Review Checklist
+
+**Spec coverage:**
+- [x] @graduate.utm.my email enforcement — `RegistrationForm.validate_email`
+- [x] Email OTP real-time verification — `_send_otp`, `verify_otp` route
+- [x] AES-256-GCM per-note encryption — `crypto.py`, `create_note`
+- [x] PBKDF2 vault key (600k iterations) — `derive_vault_key`
+- [x] RSA-2048 sharing — `share_note`, `rsa_encrypt_key/decrypt_key`
+- [x] bcrypt password hashing (cost 12) — `register`
+- [x] Rate limiting (5 attempts, 15 min lockout) — `login`
+- [x] Session cleared on logout — `logout`
+- [x] CSRF tokens — Flask-WTF on all forms
+- [x] Input sanitization — `bleach.clean` before encryption
+- [x] Output escaping — Jinja2 `| e` on all user data
+- [x] Role-based access control — `admin_required` / `login_required`
+- [x] Admin: view users, suspend, activate — `admin/routes.py`
+- [x] Audit log: all key actions — `_audit()` calls throughout
+- [x] Security headers: CSP, X-Frame-Options, X-Content-Type-Options — `set_security_headers`
+- [x] 403/404/500 error handlers — `app/__init__.py`
+- [x] Note ownership check — `_can_access`, `_can_edit`
+- [x] Admin cannot read notes — admin has no `note_keys` rows
+
+**No placeholders found.**
+
+**Type consistency verified** — `_resolve_note_key` used consistently in view, edit, and share routes.

@@ -1,0 +1,95 @@
+---
+context: default
+phase: 7-of-10 (Note Sharing)
+task: 7
+total_tasks: 10
+status: in_progress
+last_updated: 2026-06-19T09:48:59.547Z
+---
+
+# BLOCKING CONSTRAINTS — Read Before Anything Else
+
+No blocking constraints identified. Two advisory items below — read them before touching `.planning/STATE.md` or the sdd workspace path.
+
+## Critical Anti-Patterns
+
+| Pattern | Description | Severity | Prevention Mechanism |
+|---------|-------------|----------|---------------------|
+| Dual progress tracking | `.planning/STATE.md` and `.planning/ROADMAP.md` (GSD) still show 0% / Phase 1 / "ready to plan", but real implementation progress (Tasks 1-7 of 10, all committed and reviewed) is tracked only in the worktree's `.superpowers/sdd/progress.md` ledger, because this execution uses `superpowers:subagent-driven-development` directly against `docs/superpowers/plans/2026-06-17-utm-securenotes.md`, not GSD's own `/gsd-plan-phase` + `/gsd-execute-phase` flow. | advisory | Before trusting `.planning/STATE.md`'s percent/phase fields, check `.superpowers/sdd/progress.md` (path below) and `git log` on the worktree branch instead. |
+| SDD workspace path moved (v6.0.2 → v6.0.3) | The skill's scratch workspace moved from `.git/worktrees/utm-securenotes-impl/sdd/` (git-dir, blocked agent writes) to `.claude/worktrees/utm-securenotes-impl/.superpowers/sdd/` (in-tree, gitignored). The progress ledger was migrated forward this session; Tasks 1-5's historic brief/review files were left behind at the old path, untouched. | advisory | Always resolve the workspace via the v6.0.3 `sdd-workspace` script (or just use `.superpowers/sdd/` directly) — don't resume writing to the old `.git/worktrees/.../sdd/` path. |
+
+**Severity values:** `blocking` — resuming agent must pass understanding check before proceeding. `advisory` — important context, does not gate resumption.
+
+<current_state>
+No GSD phase/spike/sketch/deliberation directory exists under `.planning/` — this is genuinely a "default" context, not an oversight. The actual unit of work is **Task 7 of 10** in the original implementation plan (`docs/superpowers/plans/2026-06-17-utm-securenotes.md`), which the GSD roadmap (`.planning/ROADMAP.md`) mirrors 1:1 as its 10 phases (Task N ≈ Phase N).
+
+Tasks 6 and 7 were both completed and reviewed clean (both: Approved with Minor notes, no Critical/Important findings) in this session, inside the dedicated worktree:
+
+- Worktree path: `.claude/worktrees/utm-securenotes-impl`
+- Branch: `worktree-utm-securenotes-impl`
+- Head commit: `dcfbb3b` — "feat: note sharing — RSA-OAEP key wrapping for per-note access grants"
+- Tests: 36/36 full suite passing, no regressions.
+
+Tasks 1-5 were already complete before this session started (resumed from a prior HANDOFF.json that this session consumed). This session ran Task 6 and Task 7. The user chose to pause here rather than continue to Task 8 — they were checking in after each task, not running autonomously to the end.
+</current_state>
+
+<completed_work>
+
+Completed Tasks (full implementation plan, 10 tasks total):
+- Task 1: Project Setup — Done (commits 572fb17..51616c7 in worktree)
+- Task 2: Database Models — Done (commits 51616c7..49d8b75)
+- Task 3: Crypto Layer — Done (commits 49d8b75..7ab6840)
+- Task 4: Auth Decorators — Done (commits 7ab6840..adb8351, 1 fix round)
+- Task 5: Auth Blueprint — Done (commit adb8351..f7c4a8d, review clean)
+- Task 6: Notes Blueprint — CRUD — Done (commit f7c4a8d..04cbaba, review clean) — **completed this session**
+- Task 7: Note Sharing — Done (commit 04cbaba..dcfbb3b, review clean) — **completed this session**
+</completed_work>
+
+<remaining_work>
+
+- Task 8: Admin Blueprint — Not started. Stub exists: `app/admin/routes.py`, placeholder template `app/templates/admin/users.html` (`<html><body>Admin users</body></html>`). Needs: user list, suspend/activate, paginated audit log viewer, gated by `admin_required` (already implemented in `app/decorators.py`).
+- Task 9: Base Template & UI Hardening — Not started. This is what will let Tasks 5/6/7's standalone-HTML templates switch to `{% extends 'base.html' %}` — see decision below. By Task 9 there will be 7 templates to re-point: `auth/register.html`, `auth/verify_otp.html`, `auth/login.html`, `notes/list.html`, `notes/form.html`, `notes/view.html`, `notes/share.html`.
+- Task 10: Final Integration — Not started.
+- After Task 10: dispatch the final whole-branch code reviewer (`superpowers:requesting-code-review`), then `superpowers:finishing-a-development-branch` to decide how to merge the worktree branch back.
+</remaining_work>
+
+<decisions_made>
+
+- Migrated the SDD scratch workspace from the legacy `.git/worktrees/utm-securenotes-impl/sdd/` path (superpowers plugin v6.0.2) to `.claude/worktrees/utm-securenotes-impl/.superpowers/sdd/` (v6.0.3's `sdd-workspace` script), because Claude Code denies agent writes under `.git/`, which silently blocked implementer subagents from writing report files under the old scheme. The `progress.md` ledger was copied forward (Tasks 1-5 entries preserved) before appending Tasks 6-7. Old historic brief/review files for Tasks 1-5 remain at the legacy path, untouched.
+- Task 6's notes templates and Task 7's `share.html` render as standalone HTML, NOT `{% extends 'base.html' %}`, mirroring Task 5's auth templates — because `base.html` doesn't exist until Task 9. Each new template also needed an explicit flash-message block added (the brief's own template snippets omitted it), since the routes do call `flash()` on various paths.
+- Task 6 deliberately dropped a "Share" link from `view.html` (brief had one, but `share_note` didn't exist yet — would've raised a Jinja `BuildError`). Task 7 added it back in, owner-only, inside the existing `{% if is_owner %}` block.
+- `_can_edit` (in `app/notes/routes.py`, from Task 6) allows owner OR a `note_access` row with `permission == 'write'` to edit — broader than the spec's literal "Edit/delete: owner only" line. Adjudicated by the controller as intentional (the `note_access.permission` ENUM only makes sense if 'write' grants edit); confirmed correct by both Task 6 and Task 7 reviewers. `delete_note` remains strictly owner-only, matching spec exactly.
+- OTP hash uses bcrypt cost factor 8; password hash uses cost factor 12 (Task 5 decision, unchanged).
+- Dedicated nonce columns (`notes.nonce`, `note_keys.key_nonce`) remain locked as the schema of record; `note_keys.key_nonce` is explicitly `None` for `key_type='rsa'` rows (Task 7), matching spec. `users.rsa_private_key_encrypted` remains the sole nonce-prepended exception.
+</decisions_made>
+
+<blockers>
+None. (Two advisory-only items: see Critical Anti-Patterns table above.)
+</blockers>
+
+## Required Reading (in order)
+1. `.superpowers/sdd/progress.md` (inside the worktree's working tree, NOT `.git/worktrees/.../sdd/`) — the actual task-by-task ledger of record (NOT `.planning/STATE.md`).
+2. `docs/superpowers/plans/2026-06-17-utm-securenotes.md` — the master implementation plan; Task 8's full text is what `scripts/task-brief` will extract next.
+3. `docs/superpowers/specs/2026-06-17-utm-securenotes-design.md` — binding design spec (schema, security control table, routes, RBAC rules for `/admin`) used to build each task reviewer's global-constraints block.
+4. `.superpowers/sdd/task-6-report.md` and `.superpowers/sdd/task-7-report.md` — what those two tasks built and why, plus the deviations they tracked (standalone HTML, Share link).
+
+## Critical Anti-Patterns (do NOT repeat these)
+- [Dual progress tracking]: Don't infer project status from `.planning/STATE.md`/`ROADMAP.md` percentages — they're stale. Always check `.superpowers/sdd/progress.md` in the worktree and `git log` on `worktree-utm-securenotes-impl` for ground truth.
+- [SDD workspace path]: Use `.superpowers/sdd/` (v6.0.3), not `.git/worktrees/.../sdd/` (v6.0.2, legacy).
+
+## Infrastructure State
+- No running services, servers, or watchers.
+- Worktree `.claude/worktrees/utm-securenotes-impl` is clean except untracked `sdd/` (legacy, pre-v6.0.3-migration per-task reports for Tasks 1-5 — harmless, never committed) and untracked `.superpowers/` (current workspace, self-ignoring).
+- Main repo working tree clean except untracked `.claude/`.
+
+<context>
+This session resumed via `/gsd-resume-work` from a structured `HANDOFF.json` left after Task 5. The user confirmed "Continue to Task 6" via AskUserQuestion, then after Task 6 chose "Just do Task 7, then check in again," then after Task 7 chose "Pause here." I ran the standard subagent-driven-development loop for both tasks: `task-brief` -> dispatch implementer (sonnet) with scene-setting on prior-task interfaces and the standalone-HTML/base.html precedent -> implementer commits -> `review-package` -> dispatch task-reviewer (sonnet) with a global-constraints block built from the design spec sections 7-10 -> both reviews came back "Approved with Minor notes," no fix-and-re-review cycles needed -> appended ledger lines for both. Also discovered and migrated the SDD workspace path (v6.0.2 -> v6.0.3 convention change) before starting Task 6.
+
+The plan for resuming: pick up exactly where this session left off — run `scripts/task-brief docs/superpowers/plans/2026-06-17-utm-securenotes.md 8` from inside the worktree (using the v6.0.3 script path, not v6.0.2), dispatch a Task 8 implementer with the same pattern (scene-setting on `admin_required`, the existing `app/admin/routes.py`/`app/templates/admin/users.html` stubs, and the standalone-HTML-not-base.html precedent), then review, then ledger update, then ask the user whether to keep going through Tasks 9-10 or check in again — they've been pausing after every 1-2 tasks, not running straight through.
+</context>
+
+<next_action>
+Start with: from `C:\Users\navve\projects\SecureAppDevelopment\.claude\worktrees\utm-securenotes-impl`, run
+`bash "C:/Users/navve/.claude/plugins/cache/claude-plugins-official/superpowers/6.0.3/skills/subagent-driven-development/scripts/task-brief" docs/superpowers/plans/2026-06-17-utm-securenotes.md 8`
+then dispatch the Task 8 implementer subagent per the `subagent-driven-development` skill's template.
+</next_action>

@@ -1,0 +1,46 @@
+# Synthesis Summary
+
+Mode: new
+Precedence order: ADR > SPEC > PRD > DOC (defaults applied; no per-doc overrides present)
+
+## Docs Synthesized: 2
+
+| Type | Count | Source |
+|------|-------|--------|
+| ADR  | 0     | — |
+| SPEC | 1     | docs/superpowers/specs/2026-06-17-utm-securenotes-design.md |
+| PRD  | 0     | — |
+| DOC  | 1     | docs/superpowers/plans/2026-06-17-utm-securenotes.md |
+
+Cross-ref graph: DOC → SPEC (single directed edge). Cycle detection run: no cycles found. Traversal depth: 1 (well under the 50-depth cap).
+
+## Decisions Locked: 0
+No ADR-type documents in this batch. `decisions.md` is a placeholder pointing to that fact.
+
+## Requirements Extracted: 0 (formal PRD-style)
+No PRD-type documents in this batch. `requirements.md` is a placeholder. The SPEC's "Assignment Coverage Map" and "Security Controls Rubric" function as de facto requirements but were captured under `constraints.md` per their SPEC classification.
+
+## Constraints Extracted: 21
+All from the single SPEC (`docs/superpowers/specs/2026-06-17-utm-securenotes-design.md`, status Approved). Breakdown by type:
+- schema: 6 (users, otp_tokens, notes, note_keys, note_access, audit_logs table definitions)
+- protocol: 5 (architecture, registration flow, login flow, note create/read/share crypto flows)
+- api-contract: 3 (auth routes, notes routes, admin routes)
+- nfr: 7 (tech stack, user roles, session management, access control rules, security controls rubric, assignment coverage, input sanitization, vulnerability testing plan — several entries carry nfr-flavored content alongside their primary type)
+
+See `constraints.md` for full entries, each with `source:` attribution.
+
+## Context Topics Captured: 7
+All from the DOC (`docs/superpowers/plans/2026-06-17-utm-securenotes.md`): implementation plan overview, nonce-handling design note (flagged — see conflicts), file map/layout, pinned dependency versions, config decisions beyond SPEC scope, documented edit/re-encryption limitation for RSA-shared recipients, OTP bcrypt cost-factor note, plan author's self-review checklist.
+
+See `context.md` for full entries, each with `source:` attribution.
+
+## Conflicts: 0 blockers, 0 competing-variants, 1 auto-resolved
+
+The single auto-resolved conflict is notable: the implementation plan (DOC) claims in its own prose to implement the SPEC's dedicated nonce-column schema for `notes` and `note_keys`, but its actual SQLAlchemy models and crypto helper code do not — they use a prepended-nonce-in-blob approach instead, with no dedicated nonce columns. SPEC wins by default precedence; the SPEC's dedicated-column schema is what's recorded in `constraints.md`. Full detail and recommended resolution path in `INGEST-CONFLICTS.md`.
+
+## Pointers
+- Conflict detail: `.planning/INGEST-CONFLICTS.md`
+- Decisions: `.planning/intel/decisions.md`
+- Requirements: `.planning/intel/requirements.md`
+- Constraints: `.planning/intel/constraints.md`
+- Context: `.planning/intel/context.md`
